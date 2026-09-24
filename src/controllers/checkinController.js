@@ -118,7 +118,7 @@ function checkIn(req, res) {
   }
 
   // Bed check
-  const bed = db.prepare('SELECT * FROM beds WHERE id = ? AND property_id = ?').get(bed_id, propertyId);
+  const bed = db.prepare('SELECT * FROM beds WHERE id = ? AND property_id = ? AND removed_at IS NULL').get(bed_id, propertyId);
   if (!bed) return res.status(404).json({ error: 'Bed not found' });
   if (bed.status !== 'available' && bed.status !== 'reserved') {
     return res.status(409).json({ error: `Bed is '${bed.status}' — only available or reserved beds` });
@@ -207,6 +207,13 @@ function checkIn(req, res) {
 
     db.prepare('UPDATE residents SET id_type = ?, id_number_encrypted = ?, id_last4 = ? WHERE id = ?')
       .run(idCheck.type, idEncrypted, idLast4, residentId);
+
+    // GST on rent: copy the property's setting onto this stay (before the first bill).
+    const gst = db.prepare('SELECT gst_enabled, rent_gst_rate_bp, rent_gst_inclusive FROM properties WHERE id = ?').get(propertyId);
+    if (gst && gst.gst_enabled && Number(gst.rent_gst_rate_bp) > 0) {
+      db.prepare('UPDATE residents SET gst_rate_bp = ?, gst_inclusive = ? WHERE id = ?')
+        .run(Number(gst.rent_gst_rate_bp), gst.rent_gst_inclusive ? 1 : 0, residentId);
+    }
 
     // Claim the bed conditionally on it still being free. The status was read
     // before the transaction opened; re-asserting it here means the bed is won
