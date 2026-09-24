@@ -30,7 +30,7 @@ function listBeds(req, res) {
     LEFT JOIN residents r ON r.bed_id = b.id AND r.status = 'active'
     LEFT JOIN rooms rm ON rm.id = b.room_id
     LEFT JOIN floors f ON f.id = rm.floor_id
-    WHERE b.property_id = ?
+    WHERE b.property_id = ? AND b.removed_at IS NULL
   `;
   const params = [req.user.property_id];
   if (status)   { q += ' AND b.status = ?'; params.push(status); }
@@ -75,7 +75,7 @@ function updateBedStatus(req, res) {
   if (!VALID.includes(status)) {
     return res.status(400).json({ error: `status must be one of: ${VALID.join(', ')} — 'occupied' is set automatically on check-in` });
   }
-  const bed = db.prepare('SELECT * FROM beds WHERE id = ? AND property_id = ?')
+  const bed = db.prepare('SELECT * FROM beds WHERE id = ? AND property_id = ? AND removed_at IS NULL')
     .get(req.params.id, req.user.property_id);
   if (!bed) return res.status(404).json({ error: 'Bed not found' });
   if (bed.status === 'occupied') {
@@ -108,7 +108,7 @@ function updateBedRate(req, res) {
     return res.status(400).json({ error: 'daily_rate_paise must be a number ≥ 0' });
   }
   const rate = Math.round(rateNum);
-  const bed = db.prepare('SELECT * FROM beds WHERE id = ? AND property_id = ?')
+  const bed = db.prepare('SELECT * FROM beds WHERE id = ? AND property_id = ? AND removed_at IS NULL')
     .get(req.params.id, propertyId);
   if (!bed) return res.status(404).json({ error: 'Bed not found' });
 
@@ -175,13 +175,14 @@ function createBed(req, res) {
 /** GET /api/v1/floors — hierarchy: floors → rooms → bed count */
 function listFloors(req, res) {
   const db = getDb();
-  const floors = db.prepare('SELECT * FROM floors WHERE property_id = ? ORDER BY floor_number').all(req.user.property_id);
-  const rooms  = db.prepare('SELECT * FROM rooms WHERE property_id = ? ORDER BY length(room_number), room_number').all(req.user.property_id);
+  const floors = db.prepare('SELECT * FROM floors WHERE property_id = ? AND removed_at IS NULL ORDER BY floor_number').all(req.user.property_id);
+  const rooms  = db.prepare('SELECT * FROM rooms WHERE property_id = ? AND removed_at IS NULL ORDER BY length(room_number), room_number').all(req.user.property_id);
   const beds   = db.prepare(`
     SELECT b.id, b.room_id, b.bed_label, b.status, b.daily_rate_paise,
            r.full_name as resident_name, r.id as resident_id
     FROM beds b LEFT JOIN residents r ON r.bed_id = b.id AND r.status = 'active'
-    WHERE b.property_id = ?
+    WHERE b.property_id = ? AND b.removed_at IS NULL
+    ORDER BY b.rowid
   `).all(req.user.property_id);
 
   const result = floors.map(f => ({
@@ -210,7 +211,7 @@ function addFloor(req, res) {
   }
   if (!label) return res.status(400).json({ error: 'label is required' });
 
-  const existing = db.prepare('SELECT id FROM floors WHERE property_id = ? AND floor_number = ?').get(propertyId, floorNum);
+  const existing = db.prepare('SELECT id FROM floors WHERE property_id = ? AND floor_number = ? AND removed_at IS NULL').get(propertyId, floorNum);
   if (existing) return res.status(409).json({ error: `Floor ${floorNum} already exists` });
 
   const id = uuidv4();
@@ -265,7 +266,7 @@ function bunkerLetter(i) {
 function addBunkers(req, res) {
   const db = getDb();
   const propertyId = req.user.property_id;
-  const floor = db.prepare('SELECT * FROM floors WHERE id = ? AND property_id = ?').get(req.params.id, propertyId);
+  const floor = db.prepare('SELECT * FROM floors WHERE id = ? AND property_id = ? AND removed_at IS NULL').get(req.params.id, propertyId);
   if (!floor) return res.status(404).json({ error: 'Floor not found' });
 
   const count = Number(req.body.bunkers);
@@ -276,11 +277,11 @@ function addBunkers(req, res) {
   if (!Number.isInteger(rate) || rate < 0) return res.status(400).json({ error: 'Rate must be 0 or more' });
 
   const prefix = String(floor.floor_number);
-  const existing = db.prepare('SELECT room_number FROM rooms WHERE floor_id = ?').all(floor.id).map((r) => r.room_number);
-  const taken = new Set(db.prepare('SELECT room_number FROM rooms WHERE property_id = ?').all(propertyId).map((r) => r.room_number.toUpperCase()));
+  const existing = db.prepare('SELECT room_number FROM rooms WHERE floor_id = ? AND removed_at IS NULL').all(floor.id).map((r) => r.room_number);
+  const taken = new Set(db.prepare('SELECT room_number FROM rooms WHERE property_id = ? AND removed_at IS NULL').all(propertyId).map((r) => r.room_number.toUpperCase()));
   // Beds may have been renamed by the owner (e.g. 0A1 -> 0B2), so an auto name
   // is skipped if ANY of its bed names is already used anywhere in the property.
-  const bedTaken = new Set(db.prepare('SELECT bed_label FROM beds WHERE property_id = ?').all(propertyId).map((b) => b.bed_label.toUpperCase()));
+  const bedTaken = new Set(db.prepare('SELECT bed_label FROM beds WHERE property_id = ? AND removed_at IS NULL').all(propertyId).map((b) => b.bed_label.toUpperCase()));
   const created = [];
   const now = new Date().toISOString();
 
@@ -334,9 +335,9 @@ function renameNames(req, res) {
   const bad = (msg) => res.status(400).json({ error: msg });
 
   // Load current names so we can check the final result for duplicates.
-  const floors = new Map(db.prepare('SELECT id, label FROM floors WHERE property_id = ?').all(propertyId).map((f) => [f.id, f]));
-  const rooms  = new Map(db.prepare('SELECT id, room_number FROM rooms WHERE property_id = ?').all(propertyId).map((r) => [r.id, { ...r }]));
-  const beds   = new Map(db.prepare('SELECT id, bed_label FROM beds WHERE property_id = ?').all(propertyId).map((b) => [b.id, { ...b }]));
+  const floors = new Map(db.prepare('SELECT id, label FROM floors WHERE property_id = ? AND removed_at IS NULL').all(propertyId).map((f) => [f.id, f]));
+  const rooms  = new Map(db.prepare('SELECT id, room_number FROM rooms WHERE property_id = ? AND removed_at IS NULL').all(propertyId).map((r) => [r.id, { ...r }]));
+  const beds   = new Map(db.prepare('SELECT id, bed_label FROM beds WHERE property_id = ? AND removed_at IS NULL').all(propertyId).map((b) => [b.id, { ...b }]));
 
   const floorChanges = [], roomChanges = [], bedChanges = [];
   for (const f of floorsIn) {
@@ -387,4 +388,127 @@ function renameNames(req, res) {
   return res.json({ changed: floorChanges.length + roomChanges.length + bedChanges.length });
 }
 
-module.exports = { renameNames, listBeds, getBed, updateBedStatus, updateBedRate, bulkUpdateBedRate, createBed, listFloors, addFloor, addRoom, addBunkers, bunkerLetter };
+// ─────────────────────────────────────────────────────────────────────────────
+// Change the layout after setup: add one bed, remove a bed / bunker / floor.
+// A bed can be removed only when it is free (no guest staying, not booked).
+// Beds that never had a guest are deleted. Beds with past guests are only
+// hidden (removed_at), so old bills and reports keep showing the right bed.
+// ─────────────────────────────────────────────────────────────────────────────
+function bedHasHistory(db, bedId) {
+  return !!(db.prepare('SELECT 1 FROM residents WHERE bed_id = ? LIMIT 1').get(bedId) ||
+            db.prepare('SELECT 1 FROM booking_requests WHERE bed_id = ? LIMIT 1').get(bedId));
+}
+
+/** Throws a 409-style error object if any bed is not free. */
+function assertAllFree(db, beds) {
+  for (const b of beds) {
+    const guest = db.prepare("SELECT full_name FROM residents WHERE bed_id = ? AND status = 'active'").get(b.id);
+    if (guest || b.status === 'occupied') return `Bed ${b.bed_label} has a guest (${guest ? guest.full_name : 'staying'}). Check them out or move them first.`;
+    if (b.status === 'reserved') return `Bed ${b.bed_label} is booked. Cancel the booking first.`;
+  }
+  return null;
+}
+
+function removeBedRows(db, beds, now) {
+  let deleted = 0, hidden = 0;
+  for (const b of beds) {
+    if (bedHasHistory(db, b.id)) {
+      db.prepare("UPDATE beds SET removed_at = ?, status = 'pending', booking_request_id = NULL, updated_at = ? WHERE id = ?").run(now, now, b.id);
+      hidden++;
+    } else {
+      db.prepare('DELETE FROM beds WHERE id = ?').run(b.id);
+      deleted++;
+    }
+  }
+  return { deleted, hidden };
+}
+
+function removeRoomRow(db, roomId, now) {
+  const left = db.prepare('SELECT COUNT(*) n FROM beds WHERE room_id = ?').get(roomId).n;
+  if (left) db.prepare('UPDATE rooms SET removed_at = ? WHERE id = ?').run(now, roomId);
+  else db.prepare('DELETE FROM rooms WHERE id = ?').run(roomId);
+}
+
+function auditSafe(req, action, entityType, entityId, snapshot) {
+  try { writeAudit({ propertyId: req.user.property_id, userId: req.user.id, action, entityType, entityId, snapshot, ip: req.ip }); }
+  catch (e) { console.error('[AUDIT]', action, e.message); }
+}
+
+/** DELETE /api/v1/beds/:id */
+function removeBed(req, res) {
+  const db = getDb();
+  const pid = req.user.property_id;
+  const bed = db.prepare('SELECT * FROM beds WHERE id = ? AND property_id = ? AND removed_at IS NULL').get(req.params.id, pid);
+  if (!bed) return res.status(404).json({ error: 'Bed not found' });
+  const busy = assertAllFree(db, [bed]);
+  if (busy) return res.status(409).json({ error: busy });
+  const now = new Date().toISOString();
+  db.transaction(() => removeBedRows(db, [bed], now))();
+  auditSafe(req, 'BED_REMOVED', 'beds', bed.id, { bed: bed.bed_label });
+  return res.json({ removed: bed.bed_label });
+}
+
+/** POST /api/v1/rooms/:id/beds — add one more bed to a bunker (named next number, or a given name). */
+function addBedToRoom(req, res) {
+  const db = getDb();
+  const pid = req.user.property_id;
+  const room = db.prepare('SELECT * FROM rooms WHERE id = ? AND property_id = ? AND removed_at IS NULL').get(req.params.id, pid);
+  if (!room) return res.status(404).json({ error: 'Bunker not found' });
+  const live = db.prepare('SELECT * FROM beds WHERE room_id = ? AND removed_at IS NULL ORDER BY rowid').all(room.id);
+  if (live.length >= 12) return res.status(400).json({ error: 'A bunker can have at most 12 beds' });
+  const used = new Set(db.prepare('SELECT upper(bed_label) l FROM beds WHERE property_id = ? AND removed_at IS NULL').all(pid).map((r) => r.l));
+  let label = cleanName(req.body && req.body.label);
+  if (label) {
+    if (!NAME_RE.test(label)) return res.status(400).json({ error: `Bed name "${label}" is not valid. Use 1–20 letters, numbers, space or - _ . / #` });
+    if (used.has(label.toUpperCase())) return res.status(409).json({ error: `Bed name "${label}" is already used` });
+  } else {
+    for (let n = 1; n < 200; n++) { const l = `${room.room_number}${n}`; if (!used.has(l.toUpperCase())) { label = l; break; } }
+    if (!label || label.length > 20) return res.status(400).json({ error: 'Type a name for the new bed' });
+  }
+  const rate = req.body && req.body.daily_rate_paise !== undefined ? Number(req.body.daily_rate_paise) : (live[0] ? live[0].daily_rate_paise : 0);
+  if (!Number.isInteger(rate) || rate < 0) return res.status(400).json({ error: 'Rate must be 0 or more' });
+  const id = uuidv4(); const now = new Date().toISOString();
+  db.prepare(`INSERT INTO beds (id, room_id, property_id, bed_label, daily_rate_paise, base_rate_paise, status, created_at, updated_at)
+    VALUES (?,?,?,?,?,?,'available',?,?)`).run(id, room.id, pid, label, rate, rate, now, now);
+  auditSafe(req, 'BED_ADDED', 'beds', id, { bed: label, bunker: room.room_number });
+  return res.status(201).json(db.prepare('SELECT * FROM beds WHERE id = ?').get(id));
+}
+
+/** DELETE /api/v1/rooms/:id — remove a bunker and all its beds (all must be free). */
+function removeRoom(req, res) {
+  const db = getDb();
+  const pid = req.user.property_id;
+  const room = db.prepare('SELECT * FROM rooms WHERE id = ? AND property_id = ? AND removed_at IS NULL').get(req.params.id, pid);
+  if (!room) return res.status(404).json({ error: 'Bunker not found' });
+  const beds = db.prepare('SELECT * FROM beds WHERE room_id = ? AND removed_at IS NULL').all(room.id);
+  const busy = assertAllFree(db, beds);
+  if (busy) return res.status(409).json({ error: busy });
+  const now = new Date().toISOString();
+  db.transaction(() => { removeBedRows(db, beds, now); removeRoomRow(db, room.id, now); })();
+  auditSafe(req, 'BUNKER_REMOVED', 'rooms', room.id, { bunker: room.room_number, beds: beds.map((b) => b.bed_label) });
+  return res.json({ removed: room.room_number, beds: beds.length });
+}
+
+/** DELETE /api/v1/floors/:id — remove a floor with all its bunkers and beds (all must be free). */
+function removeFloor(req, res) {
+  const db = getDb();
+  const pid = req.user.property_id;
+  const floor = db.prepare('SELECT * FROM floors WHERE id = ? AND property_id = ? AND removed_at IS NULL').get(req.params.id, pid);
+  if (!floor) return res.status(404).json({ error: 'Floor not found' });
+  const rooms = db.prepare('SELECT * FROM rooms WHERE floor_id = ? AND removed_at IS NULL').all(floor.id);
+  const beds = rooms.length ? db.prepare(`SELECT * FROM beds WHERE removed_at IS NULL AND room_id IN (${rooms.map(() => '?').join(',')})`).all(...rooms.map((r) => r.id)) : [];
+  const busy = assertAllFree(db, beds);
+  if (busy) return res.status(409).json({ error: busy });
+  const now = new Date().toISOString();
+  db.transaction(() => {
+    removeBedRows(db, beds, now);
+    rooms.forEach((r) => removeRoomRow(db, r.id, now));
+    const left = db.prepare('SELECT COUNT(*) n FROM rooms WHERE floor_id = ?').get(floor.id).n;
+    if (left) db.prepare('UPDATE floors SET removed_at = ? WHERE id = ?').run(now, floor.id);
+    else db.prepare('DELETE FROM floors WHERE id = ?').run(floor.id);
+  })();
+  auditSafe(req, 'FLOOR_REMOVED', 'floors', floor.id, { floor: floor.label, bunkers: rooms.length, beds: beds.length });
+  return res.json({ removed: floor.label, bunkers: rooms.length, beds: beds.length });
+}
+
+module.exports = { removeBed, addBedToRoom, removeRoom, removeFloor, renameNames, listBeds, getBed, updateBedStatus, updateBedRate, bulkUpdateBedRate, createBed, listFloors, addFloor, addRoom, addBunkers, bunkerLetter };
