@@ -6,11 +6,21 @@ const ledger = require('../services/ledger');
 const { istMonth } = require('../util/time');
 const { writeAudit } = require('../middleware/auditLog');
 
-/** GET /api/v1/addons/catalog */
+const MAX_PRICE_PAISE = 10000000; // ₹1,00,000 per item — stops typing mistakes like 1000000
+const CATEGORIES = ['Food & drinks', 'Laundry', 'Services', 'Items', 'Other'];
+
+function cleanText(v, max) { return String(v == null ? '' : v).replace(/\s+/g, ' ').trim().slice(0, max); }
+function pricePaise(v) {
+  const n = Number(v);
+  return Number.isInteger(n) && n >= 0 && n <= MAX_PRICE_PAISE ? n : null;
+}
+
+/** GET /api/v1/addons/catalog  (?all=1 also returns hidden items, for Settings) */
 function getCatalog(req, res) {
   const db = getDb();
+  const all = req.query.all === '1';
   const rows = db.prepare(
-    'SELECT * FROM addon_catalog WHERE property_id = ? AND is_active = 1 ORDER BY category, name'
+    `SELECT * FROM addon_catalog WHERE property_id = ? ${all ? '' : 'AND is_active = 1'} ORDER BY is_active DESC, category, name`
   ).all(req.user.property_id);
   return res.json(rows);
 }
@@ -19,19 +29,43 @@ function getCatalog(req, res) {
 function createCatalogItem(req, res) {
   const db = getDb();
   const propertyId = req.user.property_id;
-  const { name, category, default_price_paise = 0, is_assignable = 0 } = req.body;
-
-  if (!name || !category) return res.status(400).json({ error: 'name and category are required' });
+  const name = cleanText(req.body.name, 60);
+  const category = cleanText(req.body.category, 40) || 'Other';
+  const price = pricePaise(req.body.default_price_paise === undefined ? 0 : req.body.default_price_paise);
+  if (!name) return res.status(400).json({ error: 'Item name is required' });
+  if (price === null) return res.status(400).json({ error: 'Price must be between ₹0 and ₹1,00,000' });
+  const same = db.prepare('SELECT id FROM addon_catalog WHERE property_id = ? AND lower(name) = lower(?) AND is_active = 1').get(propertyId, name);
+  if (same) return res.status(409).json({ error: `"${name}" is already in your price list` });
 
   const id  = uuidv4();
-  const now = new Date().toISOString();
   db.prepare(`
     INSERT INTO addon_catalog (id, property_id, name, category, default_price_paise, is_assignable, is_active, created_at)
     VALUES (?, ?, ?, ?, ?, ?, 1, ?)
-  `).run(id, propertyId, name.trim(), category.trim(),
-    Math.round(parseFloat(default_price_paise)), is_assignable ? 1 : 0, now);
-
+  `).run(id, propertyId, name, category, price, req.body.is_assignable ? 1 : 0, new Date().toISOString());
   return res.status(201).json(db.prepare('SELECT * FROM addon_catalog WHERE id = ?').get(id));
+}
+
+/** POST /api/v1/addons/catalog/samples — one click to add common items (skips ones already there). */
+function addSampleItems(req, res) {
+  const db = getDb();
+  const propertyId = req.user.property_id;
+  const samples = [
+    ['Tea', 'Food & drinks', 1000], ['Coffee', 'Food & drinks', 2000], ['Water bottle', 'Food & drinks', 2000],
+    ['Breakfast', 'Food & drinks', 6000], ['Maggi', 'Food & drinks', 4000],
+    ['Laundry (per kg)', 'Laundry', 5000], ['Towel', 'Items', 3000], ['Locker', 'Services', 5000],
+  ];
+  const have = new Set(db.prepare('SELECT lower(name) n FROM addon_catalog WHERE property_id = ? AND is_active = 1').all(propertyId).map((r) => r.n));
+  let added = 0;
+  db.transaction(() => {
+    const now = new Date().toISOString();
+    for (const [name, cat, price] of samples) {
+      if (have.has(name.toLowerCase())) continue;
+      db.prepare(`INSERT INTO addon_catalog (id, property_id, name, category, default_price_paise, is_assignable, is_active, created_at)
+        VALUES (?,?,?,?,?,0,1,?)`).run(uuidv4(), propertyId, name, cat, price, now);
+      added++;
+    }
+  })();
+  return res.status(201).json({ added });
 }
 
 /** PATCH /api/v1/addons/catalog/:id */
@@ -39,42 +73,44 @@ function updateCatalogItem(req, res) {
   const db = getDb();
   const item = db.prepare('SELECT * FROM addon_catalog WHERE id = ? AND property_id = ?')
     .get(req.params.id, req.user.property_id);
-  if (!item) return res.status(404).json({ error: 'Catalog item not found' });
+  if (!item) return res.status(404).json({ error: 'Item not found' });
 
-  const { name, category, default_price_paise, is_assignable, is_active } = req.body;
-  db.prepare(`
-    UPDATE addon_catalog SET name=COALESCE(?,name), category=COALESCE(?,category),
-    default_price_paise=COALESCE(?,default_price_paise),
-    is_assignable=COALESCE(?,is_assignable), is_active=COALESCE(?,is_active)
-    WHERE id=?
-  `).run(
-    name || null, category || null,
-    default_price_paise !== undefined ? Math.round(parseFloat(default_price_paise)) : null,
-    is_assignable !== undefined ? (is_assignable ? 1 : 0) : null,
-    is_active !== undefined ? (is_active ? 1 : 0) : null,
-    req.params.id
-  );
-  return res.json(db.prepare('SELECT * FROM addon_catalog WHERE id = ?').get(req.params.id));
+  const b = req.body;
+  const name = b.name !== undefined ? cleanText(b.name, 60) : item.name;
+  const category = b.category !== undefined ? (cleanText(b.category, 40) || 'Other') : item.category;
+  const price = b.default_price_paise !== undefined ? pricePaise(b.default_price_paise) : item.default_price_paise;
+  const active = b.is_active !== undefined ? (b.is_active ? 1 : 0) : item.is_active;
+  if (!name) return res.status(400).json({ error: 'Item name is required' });
+  if (price === null) return res.status(400).json({ error: 'Price must be between ₹0 and ₹1,00,000' });
+  if (active) {
+    const same = db.prepare('SELECT id FROM addon_catalog WHERE property_id = ? AND lower(name) = lower(?) AND is_active = 1 AND id != ?')
+      .get(req.user.property_id, name, item.id);
+    if (same) return res.status(409).json({ error: `"${name}" is already in your price list` });
+  }
+  db.prepare('UPDATE addon_catalog SET name = ?, category = ?, default_price_paise = ?, is_active = ?, is_assignable = COALESCE(?, is_assignable) WHERE id = ?')
+    .run(name, category, price, active, b.is_assignable !== undefined ? (b.is_assignable ? 1 : 0) : null, item.id);
+  return res.json(db.prepare('SELECT * FROM addon_catalog WHERE id = ?').get(item.id));
 }
 
 /**
- * POST /api/v1/residents/:id/addons
+ * POST /api/v1/residents/:id/addons — put items (tea, coffee, laundry…) on a guest's bill.
  *
- * FIX: Accepts payment_mode from request body instead of hardcoding 'cash'.
- * If tenant paid addon by UPI, the ledger now reflects that correctly.
+ * New shape: { items: [{ catalog_item_id | name, unit_price_paise?, quantity }],
+ *              billing_mode: 'monthly_bill' (add to bill) | 'immediate' (paid now),
+ *              payment_mode }
+ * Old shape (still accepted): { catalog_item_id | name, amount_paise, billing_mode, payment_mode }
+ *
+ * Everything is saved in one transaction: either all items are added or none.
+ * A retried request with the same Idempotency-Key is not charged twice.
  */
 function addAddonCharge(req, res) {
   const db = getDb();
   const propertyId = req.user.property_id;
   const residentId = req.params.id;
-  const {
-    catalog_item_id, name: customName, amount_paise,
-    billing_mode = 'immediate', custom_reason, billing_month,
-    payment_mode = 'cash',
-  } = req.body;
-
+  const body = req.body || {};
+  const billing_mode = body.billing_mode === undefined ? 'immediate' : body.billing_mode;
   const VALID_MODES = ['cash', 'upi', 'card', 'bank_transfer'];
-  const mode = VALID_MODES.includes(payment_mode) ? payment_mode : 'cash';
+  const mode = VALID_MODES.includes(body.payment_mode) ? body.payment_mode : 'cash';
   if (!['immediate', 'monthly_bill'].includes(billing_mode)) {
     return res.status(400).json({ error: "billing_mode must be 'immediate' or 'monthly_bill'" });
   }
@@ -82,67 +118,91 @@ function addAddonCharge(req, res) {
   const resident = db.prepare(
     "SELECT * FROM residents WHERE id = ? AND property_id = ? AND status = 'active'"
   ).get(residentId, propertyId);
-  if (!resident) return res.status(404).json({ error: 'Active resident not found' });
+  if (!resident) return res.status(404).json({ error: 'This guest is not staying now' });
 
-  let itemName = customName;
-  let itemPrice = Math.round(parseFloat(amount_paise || 0));
-  let isCustom = 1;
+  const rawItems = Array.isArray(body.items)
+    ? body.items
+    : [{ catalog_item_id: body.catalog_item_id, name: body.name, unit_price_paise: body.amount_paise, quantity: 1 }];
+  if (!rawItems.length) return res.status(400).json({ error: 'Choose at least one item' });
+  if (rawItems.length > 50) return res.status(400).json({ error: 'Too many items at once (max 50)' });
 
-  if (catalog_item_id) {
-    const catalogItem = db.prepare('SELECT * FROM addon_catalog WHERE id = ? AND property_id = ? AND is_active = 1')
-      .get(catalog_item_id, propertyId);
-    if (!catalogItem) return res.status(404).json({ error: 'Catalog item not found or inactive' });
-    itemName  = customName || catalogItem.name;
-    itemPrice = amount_paise !== undefined ? Math.round(parseFloat(amount_paise)) : catalogItem.default_price_paise;
-    isCustom  = 0;
+  // Check every item before saving anything.
+  const lines = [];
+  for (const it of rawItems) {
+    const qty = it.quantity === undefined ? 1 : Number(it.quantity);
+    if (!Number.isInteger(qty) || qty < 1 || qty > 99) return res.status(400).json({ error: 'Quantity must be 1 to 99' });
+    let name = cleanText(it.name, 60);
+    let unit = it.unit_price_paise === undefined || it.unit_price_paise === null || it.unit_price_paise === '' ? undefined : Number(it.unit_price_paise);
+    let catalogId = null;
+    if (it.catalog_item_id) {
+      const c = db.prepare('SELECT * FROM addon_catalog WHERE id = ? AND property_id = ? AND is_active = 1').get(String(it.catalog_item_id), propertyId);
+      if (!c) return res.status(404).json({ error: 'Item not found in price list (it may have been removed)' });
+      catalogId = c.id;
+      name = name || c.name;
+      if (unit === undefined) unit = c.default_price_paise;
+    }
+    if (!name) return res.status(400).json({ error: 'name is required if no catalog_item_id' });
+    if (!Number.isInteger(unit) || unit <= 0) return res.status(400).json({ error: `Price for "${name}" must be more than ₹0 (amount_paise must be > 0)` });
+    if (unit > MAX_PRICE_PAISE) return res.status(400).json({ error: `Price for "${name}" is too high` });
+    lines.push({ catalogId, name, unit, qty, amount: unit * qty, label: qty > 1 ? `${name} × ${qty}` : name });
+  }
+  const total = lines.reduce((a, l) => a + l.amount, 0);
+
+  const clientKey = req.get('Idempotency-Key') ? String(req.get('Idempotency-Key')).slice(0, 100) : null;
+  const idemBase = clientKey ? `addon:${propertyId}:${clientKey}` : null;
+  if (idemBase && db.prepare('SELECT 1 FROM ledger_entries WHERE idem_key = ?').get(`${idemBase}:0`)) {
+    return res.status(200).json({ duplicate: true, message: 'Already added', total_paise: total });
   }
 
-  if (!itemName) return res.status(400).json({ error: 'name is required if no catalog_item_id' });
-  if (!itemPrice || itemPrice <= 0) return res.status(400).json({ error: 'amount_paise must be > 0' });
-
-  const id  = uuidv4();
   const now = new Date().toISOString();
+  const month = cleanText(body.billing_month, 7) || istMonth();
+  const reason = cleanText(body.custom_reason, 200) || null;
+  const ids = [];
 
   db.transaction(() => {
-    db.prepare(`
-      INSERT INTO addon_charges
-        (id,resident_id,property_id,catalog_item_id,name,amount_paise,billing_mode,
-         is_custom_entry,custom_reason,billing_month,recorded_by,created_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-    `).run(id, residentId, propertyId, catalog_item_id || null, itemName, itemPrice,
-      billing_mode, isCustom, custom_reason || null,
-      billing_month || istMonth(), req.user.id, now);
+    lines.forEach((l, i) => {
+      const id = uuidv4();
+      ids.push(id);
+      db.prepare(`
+        INSERT INTO addon_charges
+          (id,resident_id,property_id,catalog_item_id,name,amount_paise,billing_mode,
+           is_custom_entry,custom_reason,billing_month,recorded_by,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+      `).run(id, residentId, propertyId, l.catalogId, l.label, l.amount, billing_mode,
+        l.catalogId ? 0 : 1, reason, month, req.user.id, now);
+      // Every item is owed by the guest (shows in dues and at checkout)…
+      ledger.charge({ propertyId, residentId, amountPaise: l.amount, category: 'addon',
+        reason: `Add-on: ${l.label}`, userId: req.user.id, sourceTable: 'addon_charges', sourceId: id,
+        idemKey: idemBase ? `${idemBase}:${i}` : null });
+    });
 
-    // Every add-on is owed by the resident…
-    ledger.charge({ propertyId, residentId, amountPaise: itemPrice, category: 'addon',
-      reason: `Add-on: ${itemName}`, userId: req.user.id, sourceTable: 'addon_charges', sourceId: id });
-
-    // …and 'immediate' means it was also paid right now. 'monthly_bill' stays in
-    // dues until paid (previously it was recorded nowhere and never collected).
+    // …and 'immediate' means it was also paid right now.
     if (billing_mode === 'immediate') {
       const payId = uuidv4();
+      const note = `Add-on: ${lines.map((l) => l.label).join(', ')}`.slice(0, 200);
       db.prepare(`
         INSERT INTO payment_ledger
           (id,property_id,resident_id,billing_month,amount_paise,direction,type,
            payment_mode,paid_at,requires_approval,approval_status,notes,recorded_by,created_at)
         VALUES (?,?,?,?,?,'credit','extra_charge',?,?,0,'not_required',?,?,?)
-      `).run(payId, propertyId, residentId,
-        billing_month || istMonth(), itemPrice, mode, now,
-        `Add-on: ${itemName}`, req.user.id, now);
-      ledger.payment({ propertyId, residentId, amountPaise: itemPrice, mode, category: 'addon',
+      `).run(payId, propertyId, residentId, month, total, mode, now, note, req.user.id, now);
+      ledger.payment({ propertyId, residentId, amountPaise: total, mode, category: 'addon',
         userId: req.user.id, sourceTable: 'payment_ledger', sourceId: payId });
     }
   })();
 
-  writeAudit({
-    propertyId, userId: req.user.id, action: 'ADDON_CHARGED',
-    entityType: 'addon_charges', entityId: id,
-    amountPaise: itemPrice,
-    snapshot: { name: itemName, billing_mode, payment_mode: mode, resident_id: residentId },
-    ip: req.ip,
-  });
+  try {
+    writeAudit({
+      propertyId, userId: req.user.id, action: 'ADDON_CHARGED',
+      entityType: 'addon_charges', entityId: ids[0], amountPaise: total,
+      snapshot: { items: lines.map((l) => ({ name: l.name, qty: l.qty, unit_paise: l.unit })), billing_mode, payment_mode: mode, resident_id: residentId },
+      ip: req.ip,
+    });
+  } catch (e) { console.error('[AUDIT] addon:', e.message); }
 
-  return res.status(201).json(db.prepare('SELECT * FROM addon_charges WHERE id = ?').get(id));
+  const charges = db.prepare(`SELECT * FROM addon_charges WHERE id IN (${ids.map(() => '?').join(',')})`).all(...ids);
+  // Old callers expect the single saved row; new callers get the full list.
+  return res.status(201).json(Array.isArray(body.items) ? { charges, total_paise: total } : charges[0]);
 }
 
 /** GET /api/v1/residents/:id/addons */
@@ -158,4 +218,4 @@ function getResidentAddons(req, res) {
   return res.json(rows);
 }
 
-module.exports = { getCatalog, createCatalogItem, updateCatalogItem, addAddonCharge, getResidentAddons };
+module.exports = { getCatalog, createCatalogItem, addSampleItems, updateCatalogItem, addAddonCharge, getResidentAddons, CATEGORIES };
