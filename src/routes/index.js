@@ -53,6 +53,7 @@ router.post ('/beds',            authenticate, sameProperty, can('beds_setup'), 
 router.get  ('/beds/:id',        authenticate, sameProperty, beds.getBed);
 router.patch('/beds/:id/status', authenticate, sameProperty, requireRole('reception'), beds.updateBedStatus);
 router.patch('/beds/:id/rate',   authenticate, sameProperty, can('beds_setup'), beds.updateBedRate);
+router.patch('/beds/names',     authenticate, sameProperty, can('beds_setup'), beds.renameNames);
 router.patch('/beds/bulk-rate',  authenticate, sameProperty, can('beds_setup'), beds.bulkUpdateBedRate);
 
 // ── Residents ─────────────────────────────────────────────
@@ -134,6 +135,7 @@ router.get ('/ledger/integrity',        authenticate, sameProperty, requireRole(
 // ── Add-on Catalog ────────────────────────────────────────
 router.get   ('/addons/catalog',     authenticate, sameProperty, addons.getCatalog);
 router.post  ('/addons/catalog',     authenticate, sameProperty, can('settings'), addons.createCatalogItem);
+router.post  ('/addons/catalog/samples', authenticate, sameProperty, can('settings'), addons.addSampleItems);
 router.patch ('/addons/catalog/:id', authenticate, sameProperty, can('settings'), addons.updateCatalogItem);
 
 // ── Feedback ──────────────────────────────────────────────
