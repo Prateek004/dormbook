@@ -30,6 +30,10 @@ function company(db, propertyId) {
   };
 }
 
+function billNo(rowid) { return `B-${String(rowid || 0).padStart(5, '0')}`; }
+function cleanReason(r) { return String(r || '').replace(/^Add-on:\s*/, '').replace(/^Reversal:\s*/, '').trim(); }
+function rupeesText(p) { return '₹' + (Math.round(p) / 100).toLocaleString('en-IN', { maximumFractionDigits: 2 }); }
+
 const REPORTS = {
   collections: {
     title: 'Collections Register', perm: 'reports_finance',
@@ -153,7 +157,7 @@ const REPORTS = {
   occupancy: {
     title: 'Occupancy Report', perm: 'reports_daily',
     build(db, pid, from, to) {
-      const totalBeds = db.prepare('SELECT COUNT(*) n FROM beds WHERE property_id = ?').get(pid).n;
+      const totalBeds = db.prepare('SELECT COUNT(*) n FROM beds WHERE property_id = ? AND removed_at IS NULL').get(pid).n;
       const stays = db.prepare(`SELECT check_in_date ci, COALESCE(actual_checkout, CASE WHEN status='active' THEN '9999-12-31' ELSE expected_checkout END) co
         FROM residents WHERE property_id = ? AND check_in_date <= ?`).all(pid, to);
       const rows = [];
@@ -187,6 +191,44 @@ const REPORTS = {
           col('variance', 'Short / over', 'money'), col('closed_by', 'Closed by')],
         rows, totals: { cash_in: rows.reduce((s, r) => s + r.cash_in, 0), cash_out: rows.reduce((s, r) => s + r.cash_out, 0),
           variance: rows.reduce((s, r) => s + r.variance, 0) },
+      };
+    },
+  },
+
+  gst: {
+    title: 'GST Register (Sales)', perm: 'reports_finance',
+    build(db, pid, from, to) {
+      const rows = db.prepare(`SELECT e.biz_date date, e.category, e.reason, e.amount_paise amount, e.tax_rate_bp rate,
+          COALESCE(e.tax_paise,0) tax, e.reversal_of, r.full_name guest, r.rowid rno, b.bed_label bed
+        FROM ledger_entries e JOIN residents r ON r.id = e.resident_id LEFT JOIN beds b ON b.id = r.bed_id
+        WHERE e.property_id = ? AND e.kind = 'CHARGE' AND e.biz_date BETWEEN ? AND ?
+        ORDER BY e.biz_date, e.created_at`).all(pid, from, to).map((x) => {
+        const cgst = Math.round(x.tax / 2);
+        return {
+          date: x.date, bill: billNo(x.rno), guest: x.guest || '—', bed: x.bed || '—',
+          item: (x.category === 'rent' ? 'Room rent' : cleanReason(x.reason) || LABEL[x.category] || 'Charge') + (x.reversal_of ? ' (reversed)' : ''),
+          rate: (x.rate || 0) / 100, taxable: x.amount - x.tax, cgst, sgst: x.tax - cgst, amount: x.amount,
+        };
+      });
+      const byRate = {};
+      rows.forEach((r) => {
+        const k = r.rate;
+        byRate[k] = byRate[k] || { taxable: 0, gst: 0 };
+        byRate[k].taxable += r.taxable; byRate[k].gst += r.cgst + r.sgst;
+      });
+      const sum = (k) => rows.reduce((a, r) => a + r[k], 0);
+      return {
+        columns: [col('date', 'Date', 'date'), col('bill', 'Bill no'), col('guest', 'Guest'), col('bed', 'Bed'), col('item', 'Item'),
+          col('rate', 'GST %', 'number'), col('taxable', 'Taxable value', 'money'), col('cgst', 'CGST', 'money'),
+          col('sgst', 'SGST', 'money'), col('amount', 'Total', 'money')],
+        rows, totals: { taxable: sum('taxable'), cgst: sum('cgst'), sgst: sum('sgst'), amount: sum('amount') },
+        summary: [
+          { label: 'Taxable value', value: sum('taxable'), type: 'money' },
+          { label: 'CGST', value: sum('cgst'), type: 'money' },
+          { label: 'SGST', value: sum('sgst'), type: 'money' },
+          ...Object.keys(byRate).sort((a, b) => a - b).map((k) => ({ label: `GST @ ${k}% (on ${rupeesText(byRate[k].taxable)})`, value: byRate[k].gst, type: 'money' })),
+        ],
+        notes: 'Charges billed in the period (by bill date). CGST + SGST are for sales inside your state; for IGST ask your CA. Check rates with your CA.',
       };
     },
   },
@@ -238,4 +280,4 @@ function getRegister(req, res) {
   });
 }
 
-module.exports = { listRegisters, getRegister, REPORTS };
+module.exports = { listRegisters, getRegister, REPORTS, company, billNo, cleanReason };
