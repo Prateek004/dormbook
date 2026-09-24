@@ -20,6 +20,7 @@ const receipts   = require('../controllers/receiptsController');
 const daily      = require('../controllers/dailyReportsController');
 const docs       = require('../controllers/documentsController');
 const registers  = require('../controllers/registersController');
+const summary    = require('../controllers/summaryController');
 const { can }    = require('../middleware/permissions');
 
 // ── Auth ──────────────────────────────────────────────────
@@ -45,6 +46,10 @@ router.get('/dashboard/summary', authenticate, sameProperty, finance.getDashboar
 router.get  ('/floors',          authenticate, sameProperty, beds.listFloors);
 router.post ('/floors',          authenticate, sameProperty, can('beds_setup'), beds.addFloor);
 router.post ('/floors/:id/bunkers', authenticate, sameProperty, can('beds_setup'), beds.addBunkers);
+router.delete('/floors/:id',     authenticate, sameProperty, can('beds_setup'), beds.removeFloor);
+router.post ('/rooms/:id/beds',  authenticate, sameProperty, can('beds_setup'), beds.addBedToRoom);
+router.delete('/rooms/:id',      authenticate, sameProperty, can('beds_setup'), beds.removeRoom);
+router.delete('/beds/:id',       authenticate, sameProperty, can('beds_setup'), beds.removeBed);
 router.post ('/rooms',           authenticate, sameProperty, can('beds_setup'), beds.addRoom);
 
 // ── Beds ──────────────────────────────────────────────────
@@ -92,6 +97,7 @@ router.delete('/expenses/:id',       authenticate, sameProperty, can('expenses')
 router.get   ('/reports/summary',    authenticate, sameProperty, can('reports_finance'), finance.reportSummary);
 router.get   ('/reports/registers',  authenticate, sameProperty, registers.listRegisters);
 router.get   ('/reports/registers/:type', authenticate, sameProperty, registers.getRegister);
+router.get   ('/reports/monthly',    authenticate, sameProperty, can('reports_finance'), summary.monthly);
 router.get   ('/reports/export',     authenticate, sameProperty, can('reports_finance'), finance.reportExport);
 router.get   ('/audit',              authenticate, sameProperty, can('audit'), finance.getAuditLog);
 
@@ -127,6 +133,7 @@ router.get ('/reports/daily/bed-map',   authenticate, sameProperty, can('reports
 router.get ('/reports/daily/movements', authenticate, sameProperty, can('reports_daily'), daily.movements);
 router.get ('/reports/daily/cash-book', authenticate, sameProperty, can('cash_close', 'reports_daily'), daily.cashBook);
 router.get ('/reports/daily/dues',      authenticate, sameProperty, can('reports_finance'), daily.dues);
+router.get ('/residents/:id/bill',      authenticate, sameProperty, can('payments', 'reports_finance', 'checkout'), assertOwnsResource('residents'), summary.guestBill);
 router.get ('/residents/:id/statement', authenticate, sameProperty, can('payments', 'reports_finance'), assertOwnsResource('residents'), daily.residentStatement);
 router.post('/residents/:id/discount',  authenticate, sameProperty, can('discounts'), assertOwnsResource('residents'), daily.addWaiver);
 router.post('/ledger/entries/:id/reverse', authenticate, sameProperty, requireRole('owner'),  daily.reverseEntry);
