@@ -22,6 +22,9 @@ function initDb() {
 function openDb(dbPath) {
   console.log(`[DB] Opening database at: ${dbPath}`);
   const db     = new Database(dbPath);
+  // Safety copy of existing data BEFORE any schema change or migration.
+  require('./backup').backupDb(db, dbPath, 'boot');
+  module.exports.dbPath = dbPath;
   const schema = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8');
   db.exec(schema);
 
@@ -114,6 +117,28 @@ function runMigrations(db) {
     if (!propCols2.includes(col)) {
       db.exec(`ALTER TABLE properties ADD COLUMN ${col} TEXT`);
       console.log(`[MIGRATION] Added properties.${col}`);
+    }
+  }
+
+  // GST (off by default). Rates are basis points: 500 = 5%.
+  const gstCols = {
+    properties:    [['gst_enabled', 'INTEGER NOT NULL DEFAULT 0'], ['rent_gst_rate_bp', 'INTEGER NOT NULL DEFAULT 0'], ['rent_gst_inclusive', 'INTEGER NOT NULL DEFAULT 1']],
+    residents:     [['gst_rate_bp', 'INTEGER NOT NULL DEFAULT 0'], ['gst_inclusive', 'INTEGER NOT NULL DEFAULT 1']],
+    addon_catalog: [['gst_rate_bp', 'INTEGER NOT NULL DEFAULT 0'], ['gst_inclusive', 'INTEGER NOT NULL DEFAULT 1']],
+    addon_charges: [['taxable_paise', 'INTEGER'], ['gst_paise', 'INTEGER'], ['gst_rate_bp', 'INTEGER']],
+    // Removed floors / bunkers / beds that have past guests are hidden, not deleted (history stays correct).
+    beds:   [['removed_at', 'TEXT']],
+    rooms:  [['removed_at', 'TEXT']],
+    floors: [['removed_at', 'TEXT']],
+  };
+  for (const [table, list] of Object.entries(gstCols)) {
+    const have = getColumns(table);
+    if (!have.length) continue;
+    for (const [col, type] of list) {
+      if (!have.includes(col)) {
+        db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`);
+        console.log(`[MIGRATION] Added ${table}.${col}`);
+      }
     }
   }
 
