@@ -9,6 +9,17 @@ const { writeAudit } = require('../middleware/auditLog');
 const MAX_PRICE_PAISE = 10000000; // ₹1,00,000 per item — stops typing mistakes like 1000000
 const CATEGORIES = ['Food & drinks', 'Laundry', 'Services', 'Items', 'Other'];
 
+/** GST rate from the request: basis points (500 = 5%). undefined = not sent. null = invalid. */
+function gstRate(v) {
+  if (v === undefined || v === null || v === '') return undefined;
+  const n = Number(v);
+  return ledger.GST_RATES_BP.includes(n) ? n : null;
+}
+function gstOn(db, propertyId) {
+  const p = db.prepare('SELECT gst_enabled FROM properties WHERE id = ?').get(propertyId);
+  return !!(p && p.gst_enabled);
+}
+
 function cleanText(v, max) { return String(v == null ? '' : v).replace(/\s+/g, ' ').trim().slice(0, max); }
 function pricePaise(v) {
   const n = Number(v);
@@ -34,6 +45,8 @@ function createCatalogItem(req, res) {
   const price = pricePaise(req.body.default_price_paise === undefined ? 0 : req.body.default_price_paise);
   if (!name) return res.status(400).json({ error: 'Item name is required' });
   if (price === null) return res.status(400).json({ error: 'Price must be between ₹0 and ₹1,00,000' });
+  const rate = gstRate(req.body.gst_rate_bp);
+  if (rate === null) return res.status(400).json({ error: 'GST must be 0, 5, 12, 18, 28 or 40%' });
   const same = db.prepare('SELECT id FROM addon_catalog WHERE property_id = ? AND lower(name) = lower(?) AND is_active = 1').get(propertyId, name);
   if (same) return res.status(409).json({ error: `"${name}" is already in your price list` });
 
@@ -42,6 +55,8 @@ function createCatalogItem(req, res) {
     INSERT INTO addon_catalog (id, property_id, name, category, default_price_paise, is_assignable, is_active, created_at)
     VALUES (?, ?, ?, ?, ?, ?, 1, ?)
   `).run(id, propertyId, name, category, price, req.body.is_assignable ? 1 : 0, new Date().toISOString());
+  db.prepare('UPDATE addon_catalog SET gst_rate_bp = ?, gst_inclusive = ? WHERE id = ?')
+    .run(rate || 0, req.body.gst_inclusive === false || req.body.gst_inclusive === 0 ? 0 : 1, id);
   return res.status(201).json(db.prepare('SELECT * FROM addon_catalog WHERE id = ?').get(id));
 }
 
@@ -82,6 +97,8 @@ function updateCatalogItem(req, res) {
   const active = b.is_active !== undefined ? (b.is_active ? 1 : 0) : item.is_active;
   if (!name) return res.status(400).json({ error: 'Item name is required' });
   if (price === null) return res.status(400).json({ error: 'Price must be between ₹0 and ₹1,00,000' });
+  const rate = gstRate(b.gst_rate_bp);
+  if (rate === null) return res.status(400).json({ error: 'GST must be 0, 5, 12, 18, 28 or 40%' });
   if (active) {
     const same = db.prepare('SELECT id FROM addon_catalog WHERE property_id = ? AND lower(name) = lower(?) AND is_active = 1 AND id != ?')
       .get(req.user.property_id, name, item.id);
@@ -89,6 +106,8 @@ function updateCatalogItem(req, res) {
   }
   db.prepare('UPDATE addon_catalog SET name = ?, category = ?, default_price_paise = ?, is_active = ?, is_assignable = COALESCE(?, is_assignable) WHERE id = ?')
     .run(name, category, price, active, b.is_assignable !== undefined ? (b.is_assignable ? 1 : 0) : null, item.id);
+  if (rate !== undefined) db.prepare('UPDATE addon_catalog SET gst_rate_bp = ? WHERE id = ?').run(rate, item.id);
+  if (b.gst_inclusive !== undefined) db.prepare('UPDATE addon_catalog SET gst_inclusive = ? WHERE id = ?').run(b.gst_inclusive ? 1 : 0, item.id);
   return res.json(db.prepare('SELECT * FROM addon_catalog WHERE id = ?').get(item.id));
 }
 
@@ -127,6 +146,7 @@ function addAddonCharge(req, res) {
   if (rawItems.length > 50) return res.status(400).json({ error: 'Too many items at once (max 50)' });
 
   // Check every item before saving anything.
+  const gstEnabled = gstOn(db, propertyId);
   const lines = [];
   for (const it of rawItems) {
     const qty = it.quantity === undefined ? 1 : Number(it.quantity);
@@ -134,17 +154,24 @@ function addAddonCharge(req, res) {
     let name = cleanText(it.name, 60);
     let unit = it.unit_price_paise === undefined || it.unit_price_paise === null || it.unit_price_paise === '' ? undefined : Number(it.unit_price_paise);
     let catalogId = null;
+    let rateBp = gstRate(it.gst_rate_bp);
+    if (rateBp === null) return res.status(400).json({ error: 'GST must be 0, 5, 12, 18, 28 or 40%' });
+    let inclusive = !(it.gst_inclusive === false || it.gst_inclusive === 0);
     if (it.catalog_item_id) {
       const c = db.prepare('SELECT * FROM addon_catalog WHERE id = ? AND property_id = ? AND is_active = 1').get(String(it.catalog_item_id), propertyId);
       if (!c) return res.status(404).json({ error: 'Item not found in price list (it may have been removed)' });
       catalogId = c.id;
       name = name || c.name;
       if (unit === undefined) unit = c.default_price_paise;
+      if (rateBp === undefined) { rateBp = Number(c.gst_rate_bp) || 0; inclusive = c.gst_inclusive !== 0; }
     }
+    if (!gstEnabled) rateBp = 0;   // GST switched off in Settings → no GST on anything
     if (!name) return res.status(400).json({ error: 'name is required if no catalog_item_id' });
     if (!Number.isInteger(unit) || unit <= 0) return res.status(400).json({ error: `Price for "${name}" must be more than ₹0 (amount_paise must be > 0)` });
     if (unit > MAX_PRICE_PAISE) return res.status(400).json({ error: `Price for "${name}" is too high` });
-    lines.push({ catalogId, name, unit, qty, amount: unit * qty, label: qty > 1 ? `${name} × ${qty}` : name });
+    const g = ledger.gstSplit(unit * qty, rateBp || 0, inclusive);
+    lines.push({ catalogId, name, unit, qty, amount: g.gross, tax: g.tax, taxable: g.taxable, rateBp: rateBp || 0,
+      label: qty > 1 ? `${name} × ${qty}` : name });
   }
   const total = lines.reduce((a, l) => a + l.amount, 0);
 
@@ -170,9 +197,12 @@ function addAddonCharge(req, res) {
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
       `).run(id, residentId, propertyId, l.catalogId, l.label, l.amount, billing_mode,
         l.catalogId ? 0 : 1, reason, month, req.user.id, now);
+      db.prepare('UPDATE addon_charges SET taxable_paise = ?, gst_paise = ?, gst_rate_bp = ? WHERE id = ?')
+        .run(l.taxable, l.tax, l.rateBp, id);
       // Every item is owed by the guest (shows in dues and at checkout)…
       ledger.charge({ propertyId, residentId, amountPaise: l.amount, category: 'addon',
         reason: `Add-on: ${l.label}`, userId: req.user.id, sourceTable: 'addon_charges', sourceId: id,
+        taxRateBp: l.rateBp, taxPaise: l.tax,
         idemKey: idemBase ? `${idemBase}:${i}` : null });
     });
 
@@ -202,7 +232,8 @@ function addAddonCharge(req, res) {
 
   const charges = db.prepare(`SELECT * FROM addon_charges WHERE id IN (${ids.map(() => '?').join(',')})`).all(...ids);
   // Old callers expect the single saved row; new callers get the full list.
-  return res.status(201).json(Array.isArray(body.items) ? { charges, total_paise: total } : charges[0]);
+  const gstTotal = lines.reduce((a, l) => a + l.tax, 0);
+  return res.status(201).json(Array.isArray(body.items) ? { charges, total_paise: total, gst_paise: gstTotal } : charges[0]);
 }
 
 /** GET /api/v1/residents/:id/addons */
