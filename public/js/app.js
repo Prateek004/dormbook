@@ -96,25 +96,35 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 // ── Navigation ───────────────────────────────────────────────
-// Each page shows only if the signed-in user has one of its permissions.
+// Short menu. Pages with `tabs` group several screens behind one menu item.
+// Each page/tab shows only if the signed-in user has one of its permissions.
 const PAGES = [
   { id: 'dashboard', label: '🏠 Today' },
-  { id: 'checkin',   label: '✅ Check In',     perms: ['checkin'] },
-  { id: 'residents', label: '👥 Residents' },
-  { id: 'beds',      label: '🛏 Beds' },
-  { id: 'payments',  label: '💳 Payments',     perms: ['payments', 'approvals'] },
-  { id: 'reconcile', label: '🗃 Cash Close',   perms: ['cash_close'] },
-  { id: 'bookings',  label: '📌 Bookings',     perms: ['bookings'] },
-  { id: 'addons',    label: '➕ Add-ons',      perms: ['addons'] },
-  { id: 'expenses',  label: '📋 Expenses',     perms: ['expenses'] },
-  { id: 'reports',   label: '📊 Reports',      perms: ['reports_daily', 'reports_finance'] },
-  { id: 'daily',     label: '📅 Daily View',   perms: ['reports_daily'] },
-  { id: 'staff',     label: '👤 Users & Access', perms: ['staff'] },
-  { id: 'feedback',  label: '⭐ Feedback',     perms: ['approvals'] },
-  { id: 'catalog',   label: '📦 Add-on Catalog', perms: ['settings'] },
-  { id: 'audit',     label: '🔍 Audit Log',    perms: ['audit'] },
-  { id: 'settings',  label: '⚙️ Settings',     perms: ['settings'] },
+  { id: 'checkin',   label: '✅ Check In',  perms: ['checkin'] },
+  { id: 'residents', label: '👥 Guests' },
+  { id: 'g-money',   label: '💳 Money', title: 'Money', tabs: [
+    { id: 'payments',  label: 'Payments',   perms: ['payments', 'approvals'] },
+    { id: 'expenses',  label: 'Expenses',   perms: ['expenses'] },
+    { id: 'reconcile', label: 'Cash Close', perms: ['cash_close'] },
+  ] },
+  { id: 'bookings',  label: '📌 Bookings', perms: ['bookings'] },
+  { id: 'g-reports', label: '📊 Reports', title: 'Reports', tabs: [
+    { id: 'reports', label: 'Registers',  perms: ['reports_daily', 'reports_finance'] },
+    { id: 'daily',   label: 'Daily View', perms: ['reports_daily'] },
+  ] },
+  { id: 'g-settings', label: '⚙️ Settings', title: 'Settings', tabs: [
+    { id: 'settings', label: 'Business',        perms: ['settings'] },
+    { id: 'beds',     label: 'Beds' },
+    { id: 'catalog',  label: 'Items & Prices',  perms: ['settings'] },
+    { id: 'staff',    label: 'Users & Access',  perms: ['staff'] },
+    { id: 'audit',    label: 'Audit Log',       perms: ['audit'] },
+  ] },
 ];
+
+const allowed = (p) => !p.perms || p.perms.some(can);
+function tabsOf(group) { return (group.tabs || []).filter(allowed); }
+/** The menu group a page lives in (or null for a top-level page). */
+function groupOf(page) { return PAGES.find(g => g.tabs && g.tabs.some(t => t.id === page)) || null; }
 
 /** Does the signed-in user have this permission? */
 function can(perm) {
@@ -125,7 +135,7 @@ function can(perm) {
 }
 
 function buildNav() {
-  const pages = PAGES.filter(p => !p.perms || p.perms.some(can));
+  const pages = PAGES.filter(p => p.tabs ? tabsOf(p).length : allowed(p));
   const nav   = document.getElementById('nav-list');
   nav.innerHTML = pages.map(p => `
     <li><a href="#" data-page="${p.id}">${h(p.label)}</a></li>
@@ -136,20 +146,28 @@ function buildNav() {
 }
 
 function navigate(page) {
+  // A menu group opens its last-used (or first allowed) tab.
+  const g = PAGES.find(p => p.id === page && p.tabs);
+  if (g) {
+    const tabs = tabsOf(g);
+    if (!tabs.length) return;
+    STATE.lastTab = STATE.lastTab || {};
+    page = tabs.some(t => t.id === STATE.lastTab[g.id]) ? STATE.lastTab[g.id] : tabs[0].id;
+  }
   STATE.currentPage = page;
+  const group = groupOf(page);
+  if (group) { STATE.lastTab = STATE.lastTab || {}; STATE.lastTab[group.id] = page; }
+  const navId = group ? group.id : page;
   document.querySelectorAll('.nav-list a').forEach(a =>
-    a.classList.toggle('active', a.dataset.page === page)
+    a.classList.toggle('active', a.dataset.page === navId)
   );
-  document.getElementById('page-title').textContent = titleFor(page);
-  document.getElementById('header-actions').innerHTML = '';
+  document.getElementById('page-title').textContent = group ? group.title : titleFor(page);
   renderPage(page);
 }
 
 function titleFor(page) {
-  const map = { dashboard:'Today', staff:'Users & Access', daily:'Daily View', beds:'Beds', checkin:'Check In', residents:'Residents',
-    payments:'Payments', addons:'Add-on Charges', bookings:'Bookings', reconcile:'Cash Reconciliation',
-    expenses:'Expenses', reports:'Reports', staff:'Users & Access', feedback:'Tenant Feedback',
-    catalog:'Add-on Catalog', audit:'Audit Log', settings:'Property Settings', admin:'Admin Panel' };
+  const map = { dashboard:'Today', checkin:'Check In', residents:'Guests', bookings:'Bookings',
+    feedback:'Tenant Feedback', admin:'Admin Panel' };
   return map[page] || page;
 }
 
@@ -375,7 +393,21 @@ function logout() {
 
 // ── Pages ────────────────────────────────────────────────────
 async function renderPage(page) {
-  const el = document.getElementById('page-content');
+  const main = document.getElementById('page-content');
+  document.getElementById('header-actions').innerHTML = '';
+  STATE.currentPage = page;
+  // Grouped pages get a tab bar; the screen itself renders below it.
+  const group = groupOf(page);
+  let el = main;
+  if (group) {
+    const tabs = tabsOf(group);
+    main.innerHTML = `
+      <div class="sub-tabs" role="tablist">${tabs.map(t =>
+        `<button role="tab" class="sub-tab ${t.id === page ? 'active' : ''}" aria-selected="${t.id === page}" onclick="navigate('${t.id}')">${h(t.label)}</button>`).join('')}
+      </div>
+      <div id="sub-content"></div>`;
+    el = document.getElementById('sub-content');
+  }
   el.innerHTML = '<div class="empty-state"><div class="loading-spinner" style="margin:0 auto"></div></div>';
   try {
     switch (page) {
@@ -384,7 +416,6 @@ async function renderPage(page) {
       case 'checkin':   await renderCheckin(el);   break;
       case 'residents': await renderResidents(el); break;
       case 'payments':  await renderPayments(el);  break;
-      case 'addons':    await renderAddons(el);    break;
       case 'bookings':  await renderBookings(el);  break;
       case 'reconcile': await renderReconcile(el); break;
       case 'expenses':  await renderExpenses(el);  break;
@@ -399,7 +430,9 @@ async function renderPage(page) {
       default:          el.innerHTML = '<div class="empty-state"><p>Page not found</p></div>';
     }
   } catch (ex) {
-    el.innerHTML = `<div class="error-msg">Failed to load: ${ex.message}</div>`;
+    if (ex && ex.status === 401) return;   // already sent to the login screen
+    el.innerHTML = `<div class="error-msg">Failed to load: ${h(ex.message)}</div>
+      <button class="btn btn-outline btn-sm mt-12" onclick="refreshCurrentPage()">Try again</button>`;
   }
 }
 
@@ -428,6 +461,7 @@ async function renderDashboard(el) {
       ${can('checkin') ? `<button class="btn btn-primary" onclick="navigate('checkin')">✅ Check In</button>` : ''}
       ${can('checkout') ? `<button class="btn btn-outline" onclick="navigate('residents')">🚪 Check Out</button>` : ''}
       ${can('payments') ? `<button class="btn btn-outline" onclick="navigate('payments')">💳 Take Payment</button>` : ''}
+      ${can('addons') ? `<button class="btn btn-outline" onclick="showAddItemModal()">☕ Add item</button>` : ''}
       ${can('cash_close') ? `<button class="btn btn-outline" onclick="navigate('reconcile')">🗃 Close Cash</button>` : ''}
     </div>
 
@@ -471,7 +505,7 @@ async function renderBeds(el) {
   if (!floors.length) {
     el.innerHTML = `<div class="empty-state"><div class="empty-icon">🛏</div>
       <p>No beds yet.</p>
-      ${can('beds_setup') ? `<p class="mt-12">Add your first floor: choose how many bunkers it has and how many beds each bunker has.<br/>Beds are numbered automatically: <b>0A1, 0A2, 0B1…</b></p>
+      ${can('beds_setup') ? `<p class="mt-12">Add your first floor: choose how many bunkers it has and how many beds each bunker has.<br/>Beds are numbered automatically: <b>0A1, 0A2, 0B1…</b> You can change the names later.</p>
       <button class="btn btn-primary mt-12" onclick="showAddFloorModal()">+ Add floor</button>` : ''}</div>`;
     return;
   }
@@ -500,7 +534,10 @@ function switchFloor(idx) {
   if (!floor) return;
   const fc = document.getElementById('floor-content');
   fc.innerHTML = `
-    ${can('beds_setup') ? `<div class="btn-group mb-12"><button class="btn btn-outline btn-sm" onclick="showAddBunkersModal('${floor.id}','${esc(floor.label)}')">+ Add bunkers to ${h(floor.label)}</button></div>` : ''}
+    ${can('beds_setup') ? `<div class="btn-group mb-12">
+      <button class="btn btn-outline btn-sm" onclick="showAddBunkersModal('${floor.id}','${esc(floor.label)}')">+ Add bunkers to ${h(floor.label)}</button>
+      ${floor.rooms.length ? `<button class="btn btn-outline btn-sm" onclick="showRenameModal(${idx})">✏️ Change bed names</button>` : ''}
+    </div>` : ''}
     ${floor.rooms.length ? `<div class="bunker-grid">${floor.rooms.map(rm => `
       <div class="bunker">
         <div class="bunker-name">Bunker ${h(rm.room_number)}</div>
@@ -512,6 +549,51 @@ function switchFloor(idx) {
         </div>
       </div>`).join('')}</div>`
     : `<div class="empty-state"><p>No bunkers on this floor yet.</p></div>`}`;
+}
+
+// Change names of the floor, its bunkers and beds (e.g. 0A1 → 101-A).
+function showRenameModal(idx) {
+  const floor = window._floorData[idx];
+  if (!floor) return;
+  openModal(`Change names: ${floor.label}`, `
+    <p class="td-small">Type your own names, e.g. <b>101-A</b>, <b>101-B</b>. Every bed needs its own name.
+      Bills and history stay linked — only the name changes.</p>
+    <div class="field mt-12"><label for="rn-floor">Floor name</label><input id="rn-floor" maxlength="40" value="${h(floor.label)}" /></div>
+    <div class="rename-list">${floor.rooms.map(rm => `
+      <div class="rename-bunker">
+        <div class="field"><label for="rn-r-${rm.id}">Bunker</label><input id="rn-r-${rm.id}" data-room="${rm.id}" maxlength="20" value="${h(rm.room_number)}" /></div>
+        <div class="rename-beds">${rm.beds.map(b => `
+          <div class="field"><label for="rn-b-${b.id}">Bed</label><input id="rn-b-${b.id}" data-bed="${b.id}" maxlength="20" value="${h(b.bed_label)}" /></div>`).join('')}
+        </div>
+      </div>`).join('')}
+    </div>
+    <div id="rn-error" class="error-msg hidden"></div>
+    <div class="btn-group mt-12">
+      <button class="btn btn-primary" id="rn-save" onclick="submitRename('${floor.id}')">Save names</button>
+      <button class="btn btn-outline" onclick="closeModal()">Cancel</button>
+    </div>`, { wide: true });
+}
+
+async function submitRename(floorId) {
+  const err = document.getElementById('rn-error'); err.classList.add('hidden');
+  const btn = document.getElementById('rn-save'); btn.disabled = true;
+  const rooms = [...document.querySelectorAll('[data-room]')].map(i => ({ id: i.dataset.room, name: i.value.trim() }));
+  const beds  = [...document.querySelectorAll('[data-bed]')].map(i => ({ id: i.dataset.bed, label: i.value.trim() }));
+  try {
+    const empty = [...rooms.map(r => r.name), ...beds.map(b => b.label)].some(v => !v);
+    if (empty) throw new Error('A name is empty. Every bunker and bed needs a name.');
+    const seen = new Set();
+    for (const b of beds) { const k = b.label.toUpperCase(); if (seen.has(k)) throw new Error(`Bed name "${b.label}" is used twice`); seen.add(k); }
+    const r = await api('PATCH', '/beds/names', { floors: [{ id: floorId, label: document.getElementById('rn-floor').value.trim() }], rooms, beds });
+    toast(r.changed ? 'Names saved' : 'Nothing changed', 'success'); closeModal(); renderPage('beds');
+  } catch (ex) { err.textContent = ex.message; err.classList.remove('hidden'); btn.disabled = false; }
+}
+
+async function saveBedName(bedId) {
+  const label = document.getElementById('br-name').value.trim();
+  if (!label) { toast('Type a bed name', 'warning'); return; }
+  try { await api('PATCH', '/beds/names', { beds: [{ id: bedId, label }] }); toast('Bed name saved', 'success'); closeModal(); refreshCurrentPage(); }
+  catch (ex) { toast(ex.message, 'error'); }
 }
 
 function showAddFloorModal() {
@@ -606,6 +688,7 @@ async function showBedDetail(bedId) {
       <div class="btn-group mt-12">
         <button class="btn btn-outline btn-sm" onclick="closeModal();showResidentDetail('${b.resident_id}')">View Details</button>
         ${can('payments') ? `<button class="btn btn-outline btn-sm" onclick="closeModal();showPaymentModal('${b.resident_id}','${esc(b.resident_name)}')">Record Payment</button>` : ''}
+        ${can('addons') ? `<button class="btn btn-outline btn-sm" onclick="closeModal();showAddItemModal('${b.resident_id}','${esc(b.resident_name)}')">☕ Add item</button>` : ''}
         ${can('checkout') ? `<button class="btn btn-danger btn-sm" onclick="closeModal();showCheckoutModal('${b.resident_id}','${esc(b.resident_name)}')">Check Out</button>` : ''}
       </div>
     ` : ''}
@@ -626,6 +709,11 @@ async function showBedDetail(bedId) {
     ` : ''}
     ${can('beds_setup') ? `
       <hr class="divider"/>
+      <div class="section-title">Bed name</div>
+      <div class="field-row">
+        <div class="field"><label for="br-name">Name</label><input id="br-name" maxlength="20" value="${h(b.bed_label)}" /></div>
+        <div><button class="btn btn-outline btn-sm" style="margin-top:24px" onclick="saveBedName('${bedId}')">Save name</button></div>
+      </div>
       <div class="section-title">Set Daily Rate</div>
       <div class="field-row">
         <div class="field"><label>Daily Rate (₹/day)</label><input id="br-rate" type="number" min="0" step="0.01" value="${((b.daily_rate_paise||0)/100).toFixed(2)}" /></div>
@@ -925,6 +1013,7 @@ async function renderResidents(el) {
                 <td>${fmtDate(r.check_in_date)} → <span class="${late ? 'text-danger' : ''}">${fmtDate(out)}</span>${late ? '<div class="td-small text-danger">overstaying</div>' : ''}</td>
                 <td class="num">${r.pending_rent_paise > 0 ? `<span class="text-danger fw-bold">${rupees(r.pending_rent_paise)}</span>` : r.advance_credit_paise > 0 ? `<span class="text-success">${rupees(r.advance_credit_paise)} adv</span>` : '<span class="text-success">Paid</span>'}</td>
                 <td class="actions">
+                  ${r.status === 'active' && can('addons') ? `<button class="btn btn-outline btn-sm" title="Add tea, coffee, laundry… to the bill" onclick="showAddItemModal('${r.id}','${esc(r.full_name)}')">☕ Item</button>` : ''}
                   ${r.status === 'active' && can('payments') ? `<button class="btn btn-outline btn-sm" onclick="showPaymentModal('${r.id}','${esc(r.full_name)}')">Pay</button>` : ''}
                   ${r.status === 'active' && can('checkout') ? `<button class="btn btn-danger btn-sm" onclick="showCheckoutModal('${r.id}','${esc(r.full_name)}')">Check out</button>` : ''}
                 </td></tr>`;
@@ -962,6 +1051,7 @@ async function showResidentDetail(id) {
     </div>
     <div class="btn-group mt-12">
       ${r.status === 'active' && can('payments') ? `<button class="btn btn-primary btn-sm" onclick="closeModal();showPaymentModal('${r.id}','${esc(r.full_name)}')">Record payment</button>` : ''}
+      ${r.status === 'active' && can('addons') ? `<button class="btn btn-outline btn-sm" onclick="closeModal();showAddItemModal('${r.id}','${esc(r.full_name)}')">☕ Add item</button>` : ''}
       ${can('payments') || can('reports_finance') ? `<button class="btn btn-outline btn-sm" onclick="closeModal();showStatement('${r.id}')">Statement</button>` : ''}
       ${r.status === 'active' && can('checkout') ? `<button class="btn btn-danger btn-sm" onclick="closeModal();showCheckoutModal('${r.id}','${esc(r.full_name)}')">Check out</button>` : ''}
     </div>
@@ -1201,55 +1291,128 @@ async function approvePayment(id, decision) {
 }
 
 // ── Add-ons ───────────────────────────────────────────────────
-async function renderAddons(el) {
-  const residents = await api('GET', '/residents?status=active');
-  const catalog   = await api('GET', '/addons/catalog').catch(() => []);
-  const resOpts   = residents.map(r => `<option value="${r.id}">${h(r.full_name)} — ${h(r.bed_label||'')}</option>`).join('');
-  const catOpts   = catalog.map(c => `<option value="${c.id}" data-price="${c.default_price_paise}">${h(c.name)} (${rupees(c.default_price_paise)})</option>`).join('');
+// ── Add item to a guest's bill (tea, coffee, laundry…) ─────────
+// Items come from Settings → Items & Prices. "Add to bill" puts the amount in
+// the guest's dues (collected later or at checkout); "Paid now" records the
+// payment at the same time.
+async function showAddItemModal(residentId, residentName) {
+  let catalog = [], guests = [];
+  try {
+    [catalog, guests] = await Promise.all([
+      api('GET', '/addons/catalog'),
+      residentId ? Promise.resolve([]) : api('GET', '/residents?status=active'),
+    ]);
+  } catch (ex) { toast(ex.message, 'error'); return; }
+  if (!residentId && !guests.length) { toast('No guest is staying right now', 'warning'); return; }
 
-  el.innerHTML = `
-    <div class="card">
-      <strong>Add Charge</strong>
-      <div class="field mt-12"><label>Resident *</label><select id="ao-resident">${resOpts}</select></div>
-      <div class="field"><label>Catalog Item (optional)</label>
-        <select id="ao-catalog" onchange="(function(sel){var p=sel.options[sel.selectedIndex]?.dataset?.price;document.getElementById('ao-amount').value=p?(p/100).toFixed(2):'';})(this)">
-          <option value="">— Custom Entry —</option>${catOpts}
-        </select>
+  window._cart = { lines: [], catalog };
+  openModal(residentName ? `Add item: ${residentName}` : 'Add item to bill', `
+    ${residentId ? `<input type="hidden" id="ai-guest" value="${h(residentId)}" />` : `
+      <div class="field"><label for="ai-guest">Guest *</label>
+        <select id="ai-guest"><option value="">— choose guest —</option>${guests.map(g =>
+          `<option value="${h(g.id)}">${h(g.bed_label || '—')} · ${h(g.full_name)}</option>`).join('')}</select></div>`}
+    ${catalog.length ? `
+      <div class="section-title">Tap to add</div>
+      <div class="item-grid">${catalog.map((c, i) =>
+        `<button type="button" class="item-btn" onclick="cartAdd(${i})"><span>${h(c.name)}</span><b>${rupees(c.default_price_paise)}</b></button>`).join('')}
+      </div>` : `
+      <div class="preview-box">Your price list is empty. ${can('settings')
+        ? `<a href="#" onclick="event.preventDefault();closeModal();navigate('catalog')">Add items like Tea, Coffee in Settings → Items &amp; Prices</a>, or type an item below.`
+        : 'Ask the owner to add items in Settings → Items & Prices, or type an item below.'}</div>`}
+    <details class="mt-12" ${catalog.length ? '' : 'open'}><summary class="td-small">Something not in the list?</summary>
+      <div class="field-row mt-12">
+        <div class="field"><label for="ai-other-name">Item</label><input id="ai-other-name" maxlength="60" placeholder="e.g. Extra blanket" /></div>
+        <div class="field"><label for="ai-other-price">Price (₹)</label><input id="ai-other-price" type="number" min="1" step="1" inputmode="numeric" /></div>
       </div>
-      <div class="field"><label>Name / Description *</label><input id="ao-name" placeholder="Leave blank to use catalog item name" /></div>
-      <div class="field-row">
-        <div class="field"><label>Amount (₹) *</label><input id="ao-amount" type="number" min="0.01" step="0.01" /></div>
-        <div class="field"><label>Billing Mode</label>
-          <select id="ao-billing"><option value="immediate">Immediate</option><option value="monthly_bill">Next Bill</option></select>
-        </div>
+      <button type="button" class="btn btn-outline btn-sm" onclick="cartAddOther()">+ Add</button>
+    </details>
+    <div id="ai-cart" class="mt-12"></div>
+    <div class="field mt-12"><label>How will the guest pay?</label>
+      <div class="choice-row">
+        <label class="choice"><input type="radio" name="ai-when" value="monthly_bill" checked onchange="cartRender()" /> Add to bill <span class="td-small">(pay later / at checkout)</span></label>
+        <label class="choice"><input type="radio" name="ai-when" value="immediate" onchange="cartRender()" /> Paid now</label>
       </div>
-      <div class="field-row">
-        <div class="field"><label>Payment Mode</label>
-          <select id="ao-mode"><option value="cash">Cash</option><option value="upi">UPI</option><option value="card">Card</option></select>
-        </div>
-        <div class="field"><label>Reason</label><input id="ao-reason" /></div>
-      </div>
-      <div id="ao-error" class="error-msg hidden"></div>
-      <button class="btn btn-primary mt-12" onclick="submitAddon()">Add Charge</button>
     </div>
-  `;
+    <div class="field" id="ai-mode-wrap" hidden><label for="ai-mode">Paid by</label>
+      <select id="ai-mode"><option value="cash">Cash</option><option value="upi">UPI</option><option value="card">Card</option></select></div>
+    <div id="ai-error" class="error-msg hidden"></div>
+    <div class="btn-group mt-12">
+      <button class="btn btn-primary" id="ai-submit" onclick="submitAddItems()" disabled>Add to bill</button>
+      <button class="btn btn-outline" onclick="closeModal()">Cancel</button>
+    </div>`);
+  cartRender();
 }
 
-async function submitAddon() {
-  const err = document.getElementById('ao-error');
-  err.classList.add('hidden');
-  const residentId = document.getElementById('ao-resident').value;
+function cartAdd(i) {
+  const c = window._cart.catalog[i];
+  if (!c) return;
+  const line = window._cart.lines.find(l => l.catalog_item_id === c.id);
+  if (line) line.quantity = Math.min(99, line.quantity + 1);
+  else window._cart.lines.push({ catalog_item_id: c.id, name: c.name, unit: c.default_price_paise, quantity: 1 });
+  cartRender();
+}
+
+function cartAddOther() {
+  const name = document.getElementById('ai-other-name').value.trim();
+  const unit = Math.round((parseFloat(document.getElementById('ai-other-price').value) || 0) * 100);
+  if (!name) { toast('Type the item name', 'warning'); return; }
+  if (unit <= 0) { toast('Type a price more than ₹0', 'warning'); return; }
+  window._cart.lines.push({ name, unit, quantity: 1 });
+  document.getElementById('ai-other-name').value = '';
+  document.getElementById('ai-other-price').value = '';
+  cartRender();
+}
+
+function cartQty(idx, delta) {
+  const l = window._cart.lines[idx];
+  if (!l) return;
+  l.quantity += delta;
+  if (l.quantity < 1) window._cart.lines.splice(idx, 1);
+  else l.quantity = Math.min(99, l.quantity);
+  cartRender();
+}
+
+function cartRender() {
+  const box = document.getElementById('ai-cart');
+  if (!box) return;
+  const lines = window._cart.lines;
+  const total = lines.reduce((a, l) => a + l.unit * l.quantity, 0);
+  box.innerHTML = lines.length ? `
+    <table class="cart"><tbody>${lines.map((l, i) => `
+      <tr><td>${h(l.name)}<div class="td-small">${rupees(l.unit)} each</div></td>
+        <td class="qty"><button type="button" class="btn btn-outline btn-sm" onclick="cartQty(${i},-1)" aria-label="Less">−</button>
+          <b>${l.quantity}</b>
+          <button type="button" class="btn btn-outline btn-sm" onclick="cartQty(${i},1)" aria-label="More">+</button></td>
+        <td class="num">${rupees(l.unit * l.quantity)}</td></tr>`).join('')}
+    </tbody><tfoot><tr><td colspan="2"><b>Total</b></td><td class="num"><b>${rupees(total)}</b></td></tr></tfoot></table>`
+    : '<div class="td-small text-muted">No items added yet.</div>';
+  const paidNow = document.querySelector('input[name="ai-when"]:checked')?.value === 'immediate';
+  document.getElementById('ai-mode-wrap').hidden = !paidNow;
+  const btn = document.getElementById('ai-submit');
+  btn.disabled = !lines.length;
+  btn.textContent = lines.length ? (paidNow ? `Save · ${rupees(total)} paid` : `Add ${rupees(total)} to bill`) : 'Add to bill';
+}
+
+async function submitAddItems() {
+  const err = document.getElementById('ai-error'); err.classList.add('hidden');
+  const residentId = document.getElementById('ai-guest').value;
+  if (!residentId) { err.textContent = 'Choose the guest first'; err.classList.remove('hidden'); return; }
+  const lines = window._cart.lines;
+  if (!lines.length) return;
+  const when = document.querySelector('input[name="ai-when"]:checked').value;
+  const btn = document.getElementById('ai-submit'); btn.disabled = true;
   try {
-    await api('POST', `/residents/${residentId}/addons`, {
-      catalog_item_id: document.getElementById('ao-catalog').value || undefined,
-      name:            document.getElementById('ao-name').value.trim() || undefined,
-      amount_paise:    Math.round((parseFloat(document.getElementById('ao-amount').value) || 0) * 100),
-      billing_mode:    document.getElementById('ao-billing').value,
-      payment_mode:    document.getElementById('ao-mode').value,
-      custom_reason:   document.getElementById('ao-reason').value.trim(),
+    const r = await api('POST', `/residents/${residentId}/addons`, {
+      items: lines.map(l => l.catalog_item_id
+        ? { catalog_item_id: l.catalog_item_id, quantity: l.quantity }
+        : { name: l.name, unit_price_paise: l.unit, quantity: l.quantity }),
+      billing_mode: when,
+      payment_mode: document.getElementById('ai-mode').value,
     });
-    toast('Add-on charge recorded', 'success'); renderPage('addons');
-  } catch(ex) { err.textContent = ex.message; err.classList.remove('hidden'); }
+    toast(when === 'immediate' ? `${rupees(r.total_paise)} saved as paid` : `${rupees(r.total_paise)} added to the bill`, 'success');
+    closeModal();
+    refreshCurrentPage();
+  } catch (ex) { err.textContent = ex.message; err.classList.remove('hidden'); btn.disabled = false; }
 }
 
 // ── Bookings ──────────────────────────────────────────────────
@@ -1725,69 +1888,72 @@ async function submitDiscount(residentId) {
 }
 
 // ── Property Settings (owner only) ────────────────────────────
+// ── Settings → Business (letterhead + simple rules) ───────────
 async function renderSettings(el) {
-  let settings;
-  try {
-    settings = await api('GET', '/properties/settings');
-  } catch(ex) {
-    el.innerHTML = `<div class="error-msg">Could not load settings: ${ex.message}</div>`;
-    return;
-  }
+  const st = await api('GET', '/properties/settings');
+  const rs = (p) => ((p || 0) / 100);
   el.innerHTML = `
-    <div class="card">
-      <strong>Property Settings</strong>
-      <div class="field mt-12"><label>Property Name</label><input id="ps-name" value="${h(settings.name||'')}" /></div>
-      <div class="section-title">Shown on reports</div>
-      <div class="field"><label>Address</label><input id="ps-address" value="${h(settings.address||'')}" placeholder="Building, street, area" /></div>
-      <div class="field-row">
-        <div class="field"><label>City</label><input id="ps-city" value="${h(settings.city||'')}" /></div>
-        <div class="field"><label>State</label><input id="ps-state" value="${h(settings.state||'')}" /></div>
+    <div class="card mb-20">
+      <strong>Business details</strong>
+      <p class="td-small mt-4">Printed at the top of every report and receipt.</p>
+      <div class="field-row mt-12">
+        <div class="field"><label for="ps-company">Company name *</label><input id="ps-company" maxlength="120" value="${h(st.business_name || '')}" placeholder="e.g. A&P Infotech Solutions Pvt Ltd" /></div>
+        <div class="field"><label for="ps-name">Dormitory name *</label><input id="ps-name" maxlength="120" value="${h(st.name || '')}" /></div>
       </div>
-      <div class="field-row">
-        <div class="field"><label>PIN code</label><input id="ps-pin" value="${h(settings.pincode||'')}" inputmode="numeric" maxlength="6" /></div>
-        <div class="field"><label>Phone</label><input id="ps-phone" value="${h(settings.contact_phone||'')}" type="tel" /></div>
+      <div class="field"><label for="ps-address">Address</label><input id="ps-address" maxlength="250" value="${h(st.address || '')}" placeholder="Building, street, area" /></div>
+      <div class="field-row three">
+        <div class="field"><label for="ps-city">City</label><input id="ps-city" maxlength="60" value="${h(st.city || '')}" /></div>
+        <div class="field"><label for="ps-state">State</label><input id="ps-state" maxlength="60" value="${h(st.state || '')}" /></div>
+        <div class="field"><label for="ps-pin">PIN code</label><input id="ps-pin" value="${h(st.pincode || '')}" inputmode="numeric" maxlength="6" /></div>
       </div>
-      <div class="field-row">
-        <div class="field"><label>Email</label><input id="ps-email" value="${h(settings.contact_email||'')}" type="email" /></div>
-        <div class="field"><label>GSTIN (optional)</label><input id="ps-gstin" value="${h(settings.gstin||'')}" maxlength="15" /></div>
+      <div class="field-row three">
+        <div class="field"><label for="ps-phone">Phone</label><input id="ps-phone" value="${h(st.contact_phone || '')}" type="tel" maxlength="20" /></div>
+        <div class="field"><label for="ps-email">Email</label><input id="ps-email" value="${h(st.contact_email || '')}" type="email" maxlength="120" /></div>
+        <div class="field"><label for="ps-gstin">GSTIN <span class="td-small">(optional)</span></label><input id="ps-gstin" value="${h(st.gstin || '')}" maxlength="15" style="text-transform:uppercase" /></div>
       </div>
-      <div class="section-title">Rules</div>
-      <div class="field"><label>WhatsApp Number (with country code)</label><input id="ps-wa" value="${settings.whatsapp_number||''}" placeholder="919999900001" /></div>
-      <div class="field-row">
-        <div class="field"><label>Cleaning Timeout (minutes)</label><input id="ps-clean" type="number" min="0" value="${settings.cleaning_timeout_minutes||120}" /></div>
-        <div class="field"><label>Refund Approval Threshold (₹)</label><input id="ps-refund" type="number" min="0" step="0.01" value="${((settings.refund_approval_threshold_paise||0)/100).toFixed(2)}" /></div>
-      </div>
-      <div class="field-row">
-        <div class="field"><label>Booking Lock (hours)</label><input id="ps-lock" type="number" min="1" value="${settings.booking_lock_hours||24}" /></div>
-        <div class="field"><label>Cash Tolerance (₹)</label><input id="ps-cash" type="number" min="0" step="0.01" value="${((settings.cash_reconciliation_tolerance_paise||0)/100).toFixed(2)}" /></div>
-      </div>
-      <div id="ps-error" class="error-msg hidden"></div>
-      <button class="btn btn-primary mt-12" onclick="submitSettings()">Save Settings</button>
     </div>
-  `;
+    <div class="card mb-20">
+      <strong>Rules</strong>
+      <div class="field-row mt-12">
+        <div class="field"><label for="ps-clean">Bed cleaning time (minutes)</label><input id="ps-clean" type="number" min="5" max="1440" value="${st.cleaning_timeout_minutes || 120}" />
+          <div class="field-note">After checkout a bed shows "cleaning". It becomes vacant by itself after this time.</div></div>
+        <div class="field"><label for="ps-lock">Hold a booked bed for (hours)</label><input id="ps-lock" type="number" min="1" max="720" value="${st.booking_lock_hours || 24}" />
+          <div class="field-note">An unconfirmed booking is released after this time.</div></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label for="ps-refund">Staff refunds above (₹) need approval</label><input id="ps-refund" type="number" min="0" step="1" value="${rs(st.refund_approval_threshold_paise)}" />
+          <div class="field-note">0 = every refund by staff needs approval.</div></div>
+        <div class="field"><label for="ps-cash">Cash difference allowed at close (₹)</label><input id="ps-cash" type="number" min="0" step="1" value="${rs(st.cash_reconciliation_tolerance_paise)}" />
+          <div class="field-note">A bigger difference must be explained.</div></div>
+      </div>
+    </div>
+    <div id="ps-error" class="error-msg hidden"></div>
+    <button class="btn btn-primary" id="ps-save" onclick="submitSettings()">Save settings</button>`;
 }
 
 async function submitSettings() {
-  const err = document.getElementById('ps-error');
-  err.classList.add('hidden');
+  const err = document.getElementById('ps-error'); err.classList.add('hidden');
+  const v = (id) => document.getElementById(id).value.trim();
+  const int = (id) => { const n = Number(v(id)); return Number.isFinite(n) ? Math.round(n) : NaN; };
+  const btn = document.getElementById('ps-save'); btn.disabled = true;
   try {
+    if (!v('ps-company')) throw new Error('Company name cannot be empty');
+    if (!v('ps-name')) throw new Error('Dormitory name cannot be empty');
+    for (const [id, label] of [['ps-clean', 'Cleaning time'], ['ps-lock', 'Booking hold'], ['ps-refund', 'Refund limit'], ['ps-cash', 'Cash difference']]) {
+      if (v(id) === '' || Number.isNaN(int(id)) || int(id) < 0) throw new Error(`${label}: type a number (0 or more)`);
+    }
     await api('PATCH', '/properties/settings', {
-      name:                              document.getElementById('ps-name').value.trim() || undefined,
-      address:       document.getElementById('ps-address').value.trim() || undefined,
-      city:          document.getElementById('ps-city').value.trim() || undefined,
-      state:         document.getElementById('ps-state').value.trim() || undefined,
-      pincode:       document.getElementById('ps-pin').value.trim() || undefined,
-      contact_phone: document.getElementById('ps-phone').value.trim(),
-      contact_email: document.getElementById('ps-email').value.trim(),
-      gstin:         document.getElementById('ps-gstin').value.trim(),
-      whatsapp_number:                   document.getElementById('ps-wa').value.trim() || undefined,
-      cleaning_timeout_minutes:          parseInt(document.getElementById('ps-clean').value),
-      refund_approval_threshold_paise:   Math.round((parseFloat(document.getElementById('ps-refund').value) || 0) * 100),
-      booking_lock_hours:                parseInt(document.getElementById('ps-lock').value),
-      cash_reconciliation_tolerance_paise: Math.round((parseFloat(document.getElementById('ps-cash').value) || 0) * 100),
+      business_name: v('ps-company'), name: v('ps-name'),
+      address: v('ps-address'), city: v('ps-city'), state: v('ps-state'), pincode: v('ps-pin'),
+      contact_phone: v('ps-phone'), contact_email: v('ps-email'), gstin: v('ps-gstin'),
+      cleaning_timeout_minutes: int('ps-clean'),
+      booking_lock_hours: int('ps-lock'),
+      refund_approval_threshold_paise: int('ps-refund') * 100,
+      cash_reconciliation_tolerance_paise: int('ps-cash') * 100,
     });
     toast('Settings saved', 'success');
-  } catch(ex) { err.textContent = ex.message; err.classList.remove('hidden'); }
+    renderPage('settings');
+  } catch (ex) { err.textContent = ex.message; err.classList.remove('hidden'); btn.disabled = false; }
 }
 
 // ── Staff ─────────────────────────────────────────────────────
@@ -1921,54 +2087,89 @@ async function resolveFeedback(id) {
 }
 
 // ── Add-on Catalog ────────────────────────────────────────────
+// ── Settings → Items & Prices (tea, coffee, laundry… for guests' bills) ──
+const ITEM_CATEGORIES = ['Food & drinks', 'Laundry', 'Services', 'Items', 'Other'];
+
 async function renderCatalog(el) {
-  const items = await api('GET', '/addons/catalog');
+  const items = await api('GET', '/addons/catalog?all=1');
+  const active = items.filter(i => i.is_active), hidden = items.filter(i => !i.is_active);
+  const catOpts = (sel) => ITEM_CATEGORIES.map(c => `<option ${c === sel ? 'selected' : ''}>${h(c)}</option>`).join('');
   el.innerHTML = `
     <div class="card mb-20">
-      <strong>Add Catalog Item</strong>
-      <div class="field-row mt-12">
-        <div class="field"><label>Name *</label><input id="cat-name" /></div>
-        <div class="field"><label>Category *</label><input id="cat-cat" placeholder="utilities, amenities, etc." /></div>
-      </div>
-      <div class="field-row">
-        <div class="field"><label>Default Price (₹)</label><input id="cat-price" type="number" min="0" step="0.01" value="0" /></div>
-        <div class="field"><label>Assignable Item?</label>
-          <select id="cat-assign"><option value="0">No</option><option value="1">Yes (tracked item)</option></select>
-        </div>
+      <strong>Items guests can buy</strong>
+      <p class="td-small mt-4">These show as quick buttons when you press <b>☕ Add item</b> on Today, Guests or a bed.
+        The amount goes on the guest's bill and is collected with rent or at checkout.</p>
+      <div class="field-row three mt-12">
+        <div class="field"><label for="cat-name">Item name *</label><input id="cat-name" maxlength="60" placeholder="e.g. Tea" /></div>
+        <div class="field"><label for="cat-price">Price (₹) *</label><input id="cat-price" type="number" min="0" step="1" inputmode="numeric" placeholder="e.g. 10" /></div>
+        <div class="field"><label for="cat-cat">Type</label><select id="cat-cat">${catOpts('Food & drinks')}</select></div>
       </div>
       <div id="cat-error" class="error-msg hidden"></div>
-      <button class="btn btn-primary mt-12" onclick="submitCatalogItem()">Add to Catalog</button>
+      <div class="btn-group mt-12">
+        <button class="btn btn-primary" onclick="submitCatalogItem()">+ Add item</button>
+        ${active.length < 3 ? `<button class="btn btn-outline" onclick="addSampleItems()">Add common items (Tea, Coffee, Laundry…)</button>` : ''}
+      </div>
     </div>
+    ${active.length ? `
     <div class="card table-wrap">
       <table>
-        <thead><tr><th>Name</th><th>Category</th><th>Price</th><th>Assignable</th><th>Status</th></tr></thead>
-        <tbody>
-          ${items.map(i => `
-            <tr>
-              <td class="td-name">${h(i.name)}</td><td>${h(i.category)}</td>
-              <td>${rupees(i.default_price_paise)}</td>
-              <td>${i.is_assignable?'Yes':'No'}</td>
-              <td><span class="badge ${i.is_active?'badge-success':'badge-gray'}">${i.is_active?'Active':'Inactive'}</span></td>
-            </tr>
-          `).join('')}
+        <thead><tr><th>Item</th><th>Type</th><th>Price (₹)</th><th></th></tr></thead>
+        <tbody>${active.map(i => `
+          <tr>
+            <td><input class="cell-input" id="ci-n-${i.id}" value="${h(i.name)}" maxlength="60" aria-label="Item name" /></td>
+            <td><select class="cell-input" id="ci-c-${i.id}" aria-label="Type">${catOpts(i.category)}${ITEM_CATEGORIES.includes(i.category) ? '' : `<option selected>${h(i.category)}</option>`}</select></td>
+            <td><input class="cell-input num" id="ci-p-${i.id}" type="number" min="0" step="1" value="${(i.default_price_paise / 100)}" aria-label="Price" /></td>
+            <td class="actions">
+              <button class="btn btn-outline btn-sm" onclick="saveCatalogItem('${i.id}')">Save</button>
+              <button class="btn btn-outline btn-sm" onclick="setCatalogActive('${i.id}', false)">Remove</button>
+            </td>
+          </tr>`).join('')}
         </tbody>
       </table>
-    </div>
-  `;
+    </div>` : `<div class="empty-state"><div class="empty-icon">☕</div><p>No items yet. Add Tea, Coffee etc. above.</p></div>`}
+    ${hidden.length ? `
+    <details class="mt-12"><summary class="td-small">Removed items (${hidden.length})</summary>
+      <div class="card mt-12">${hidden.map(i => `
+        <div class="task-row"><div>${h(i.name)} · ${rupees(i.default_price_paise)}</div>
+          <button class="btn btn-outline btn-sm" onclick="setCatalogActive('${i.id}', true)">Bring back</button></div>`).join('')}
+      </div></details>` : ''}`;
 }
 
 async function submitCatalogItem() {
-  const err = document.getElementById('cat-error');
-  err.classList.add('hidden');
+  const err = document.getElementById('cat-error'); err.classList.add('hidden');
+  const priceTxt = document.getElementById('cat-price').value;
   try {
+    if (priceTxt === '' || !(parseFloat(priceTxt) >= 0)) throw new Error('Type a price (0 or more)');
     await api('POST', '/addons/catalog', {
-      name:                 document.getElementById('cat-name').value.trim(),
-      category:             document.getElementById('cat-cat').value.trim(),
-      default_price_paise:  Math.round((parseFloat(document.getElementById('cat-price').value) || 0) * 100),
-      is_assignable:        parseInt(document.getElementById('cat-assign').value),
+      name:                document.getElementById('cat-name').value.trim(),
+      category:            document.getElementById('cat-cat').value,
+      default_price_paise: Math.round(parseFloat(priceTxt) * 100),
     });
-    toast('Catalog item added', 'success'); renderPage('catalog');
-  } catch(ex) { err.textContent = ex.message; err.classList.remove('hidden'); }
+    toast('Item added', 'success'); renderPage('catalog');
+  } catch (ex) { err.textContent = ex.message; err.classList.remove('hidden'); }
+}
+
+async function saveCatalogItem(id) {
+  const priceTxt = document.getElementById(`ci-p-${id}`).value;
+  try {
+    if (priceTxt === '' || !(parseFloat(priceTxt) >= 0)) throw new Error('Type a price (0 or more)');
+    await api('PATCH', `/addons/catalog/${id}`, {
+      name: document.getElementById(`ci-n-${id}`).value.trim(),
+      category: document.getElementById(`ci-c-${id}`).value,
+      default_price_paise: Math.round(parseFloat(priceTxt) * 100),
+    });
+    toast('Saved', 'success'); renderPage('catalog');
+  } catch (ex) { toast(ex.message, 'error'); }
+}
+
+async function setCatalogActive(id, on) {
+  try { await api('PATCH', `/addons/catalog/${id}`, { is_active: on }); toast(on ? 'Item is back in the list' : 'Item removed from the list', 'success'); renderPage('catalog'); }
+  catch (ex) { toast(ex.message, 'error'); }
+}
+
+async function addSampleItems() {
+  try { const r = await api('POST', '/addons/catalog/samples', {}); toast(r.added ? `${r.added} items added — change prices if needed` : 'These items are already in your list', 'success'); renderPage('catalog'); }
+  catch (ex) { toast(ex.message, 'error'); }
 }
 
 // ── Audit Log ─────────────────────────────────────────────────
