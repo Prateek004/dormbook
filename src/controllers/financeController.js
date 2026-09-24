@@ -200,67 +200,95 @@ function getPropertySettings(req, res) {
   const db = getDb();
   const prop = db.prepare('SELECT * FROM properties WHERE id = ?').get(req.user.property_id);
   if (!prop) return res.status(404).json({ error: 'Property not found' });
-  return res.json(prop);
+  const acc = prop.account_id ? db.prepare('SELECT business_name FROM accounts WHERE id = ?').get(prop.account_id) : null;
+  return res.json({ ...prop, business_name: acc ? acc.business_name : prop.name });
 }
 
+/**
+ * PATCH /api/v1/properties/settings
+ * Only fields that are sent are changed. Text fields can be cleared by sending "".
+ * Every value is checked first; nothing is saved if any value is wrong.
+ */
 function updatePropertySettings(req, res) {
   const db = getDb();
   const propertyId = req.user.property_id;
-
   const prop = db.prepare('SELECT * FROM properties WHERE id = ?').get(propertyId);
   if (!prop) return res.status(404).json({ error: 'Property not found' });
 
-  const {
-    name, address, city, state, pincode, whatsapp_number,
-    cleaning_timeout_minutes, refund_approval_threshold_paise,
-    daily_summary_time, eod_report_time, timezone,
-    cash_reconciliation_tolerance_paise, booking_lock_hours, property_code,
-    contact_phone, contact_email, gstin,
-  } = req.body;
+  const b = req.body || {};
+  const has = (k) => Object.prototype.hasOwnProperty.call(b, k) && b[k] !== undefined && b[k] !== null;
+  const text = (k, max) => String(b[k]).replace(/\s+/g, ' ').trim().slice(0, max);
+  const cols = new Set(db.prepare("SELECT name FROM pragma_table_info('properties')").all().map((c) => c.name));
+  const set = {};      // properties column -> value
+  let businessName;    // accounts.business_name
 
-  db.prepare(`
-    UPDATE properties SET
-      name=COALESCE(?,name), address=COALESCE(?,address), city=COALESCE(?,city),
-      state=COALESCE(?,state), pincode=COALESCE(?,pincode),
-      whatsapp_number=COALESCE(?,whatsapp_number),
-      cleaning_timeout_minutes=COALESCE(?,cleaning_timeout_minutes),
-      refund_approval_threshold_paise=COALESCE(?,refund_approval_threshold_paise),
-      daily_summary_time=COALESCE(?,daily_summary_time),
-      eod_report_time=COALESCE(?,eod_report_time),
-      timezone=COALESCE(?,timezone),
-      cash_reconciliation_tolerance_paise=COALESCE(?,cash_reconciliation_tolerance_paise),
-      booking_lock_hours=COALESCE(?,booking_lock_hours),
-      property_code=COALESCE(?,property_code),
-      updated_at=datetime('now')
-    WHERE id=?
-  `).run(
-    name || null, address || null, city || null, state || null, pincode || null,
-    whatsapp_number || null,
-    cleaning_timeout_minutes !== undefined ? cleaning_timeout_minutes : null,
-    refund_approval_threshold_paise !== undefined ? refund_approval_threshold_paise : null,
-    daily_summary_time || null, eod_report_time || null, timezone || null,
-    cash_reconciliation_tolerance_paise !== undefined ? cash_reconciliation_tolerance_paise : null,
-    booking_lock_hours !== undefined ? booking_lock_hours : null,
-    property_code || null,
-    propertyId
-  );
+  if (has('business_name')) {
+    businessName = text('business_name', 120);
+    if (!businessName) return res.status(400).json({ error: 'Company name cannot be empty' });
+  }
+  if (has('name')) {
+    set.name = text('name', 120);
+    if (!set.name) return res.status(400).json({ error: 'Property name cannot be empty' });
+  }
+  for (const [k, max] of [['address', 250], ['city', 60], ['state', 60]]) if (has(k)) set[k] = text(k, max) || null;
+  if (has('pincode')) {
+    const v = text('pincode', 10);
+    if (v && !/^\d{6}$/.test(v)) return res.status(400).json({ error: 'PIN code must be 6 digits' });
+    set.pincode = v || null;
+  }
+  if (has('contact_phone')) {
+    const v = text('contact_phone', 20);
+    if (v && !/^[+\d][\d\s-]{6,18}$/.test(v)) return res.status(400).json({ error: 'Phone number is not valid' });
+    set.contact_phone = v || null;
+  }
+  if (has('contact_email')) {
+    const v = text('contact_email', 120);
+    if (v && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)) return res.status(400).json({ error: 'Email is not valid' });
+    set.contact_email = v || null;
+  }
+  if (has('gstin')) {
+    const v = text('gstin', 15).toUpperCase();
+    if (v && !/^\d{2}[A-Z0-9]{13}$/.test(v)) return res.status(400).json({ error: 'GSTIN must be 15 characters (e.g. 07ABCDE1234F1Z5)' });
+    set.gstin = v || null;
+  }
+  if (has('whatsapp_number')) set.whatsapp_number = text('whatsapp_number', 20) || null;
 
-  writeAudit({
-    propertyId, userId: req.user.id, action: 'PROPERTY_SETTINGS_UPDATED',
-    entityType: 'properties', entityId: propertyId,
-    snapshot: { updated_fields: req.body },
-    ip: req.ip,
-  });
-
-  // Letterhead fields (added by migration; may be absent on very old databases)
-  const cols = new Set(db.prepare("SELECT name FROM pragma_table_info('properties')").all().map(c => c.name));
-  const clip = (v, n) => (v === undefined || v === null ? undefined : String(v).trim().slice(0, n));
-  for (const [col, val] of [['contact_phone', clip(contact_phone, 20)], ['contact_email', clip(contact_email, 120)],
-    ['gstin', clip(gstin, 15) === undefined ? undefined : clip(gstin, 15).toUpperCase()]]) {
-    if (val !== undefined && cols.has(col)) db.prepare(`UPDATE properties SET ${col} = ? WHERE id = ?`).run(val || null, propertyId);
+  const ints = [
+    ['cleaning_timeout_minutes', 5, 1440, 'Cleaning time must be 5 to 1440 minutes'],
+    ['booking_lock_hours', 1, 720, 'Booking hold must be 1 to 720 hours'],
+    ['refund_approval_threshold_paise', 0, 100000000, 'Refund approval limit is not valid'],
+    ['cash_reconciliation_tolerance_paise', 0, 10000000, 'Cash difference allowed is not valid'],
+  ];
+  for (const [k, min, max, msg] of ints) {
+    if (!has(k)) continue;
+    const n = Number(b[k]);
+    if (!Number.isInteger(n) || n < min || n > max) return res.status(400).json({ error: msg });
+    set[k] = n;
   }
 
-  return res.json(db.prepare('SELECT * FROM properties WHERE id = ?').get(propertyId));
+  const keys = Object.keys(set).filter((k) => cols.has(k));
+  db.transaction(() => {
+    if (keys.length) {
+      db.prepare(`UPDATE properties SET ${keys.map((k) => `${k} = ?`).join(', ')}, updated_at = datetime('now') WHERE id = ?`)
+        .run(...keys.map((k) => set[k]), propertyId);
+    }
+    if (businessName !== undefined && prop.account_id) {
+      db.prepare("UPDATE accounts SET business_name = ?, updated_at = datetime('now') WHERE id = ?").run(businessName, prop.account_id);
+    }
+  })();
+
+  try {
+    writeAudit({
+      propertyId, userId: req.user.id, action: 'PROPERTY_SETTINGS_UPDATED',
+      entityType: 'properties', entityId: propertyId,
+      snapshot: { updated_fields: { ...set, ...(businessName !== undefined ? { business_name: businessName } : {}) } },
+      ip: req.ip,
+    });
+  } catch (e) { console.error('[AUDIT] settings:', e.message); }
+
+  const out = db.prepare('SELECT * FROM properties WHERE id = ?').get(propertyId);
+  const acc = out.account_id ? db.prepare('SELECT business_name FROM accounts WHERE id = ?').get(out.account_id) : null;
+  return res.json({ ...out, business_name: acc ? acc.business_name : out.name });
 }
 
 /** GET /api/v1/properties/profile — letterhead for reports (any signed-in user). */
