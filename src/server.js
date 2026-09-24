@@ -105,9 +105,26 @@ function checkRequiredEnv() {
   if (!jwt || jwt.startsWith('CHANGE_ME') || jwt.length < 32) problems.push('JWT_SECRET missing or shorter than 32 characters');
   const aes = process.env.AES_256_KEY;
   if (!aes || !/^[0-9a-fA-F]{64}$/.test(aes)) problems.push('AES_256_KEY must be exactly 64 hex characters (openssl rand -hex 32)');
+  // On Railway the container disk is wiped on every deploy/restart. Without a
+  // volume mounted at DB_DIR, all accounts and data vanish and every open
+  // browser gets "User not found or deactivated". Refuse to run like that.
+  const onRailway = !!(process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_PROJECT_ID || process.env.RAILWAY_SERVICE_ID);
+  if (onRailway && process.env.ALLOW_EPHEMERAL_DB !== 'true') {
+    const dbDir = path.resolve(process.env.DB_DIR || '/data');
+    const mount = process.env.RAILWAY_VOLUME_MOUNT_PATH ? path.resolve(process.env.RAILWAY_VOLUME_MOUNT_PATH) : '';
+    if (!mount) {
+      problems.push(`No volume attached. In Railway: service → Settings → Volumes → add a volume with mount path ${dbDir}`);
+    } else if (dbDir !== mount && !dbDir.startsWith(mount + path.sep)) {
+      problems.push(`DB_DIR (${dbDir}) is not inside the volume mount (${mount}). Set DB_DIR=${mount}`);
+    }
+  }
   if (problems.length) {
-    console.error('[BOOT ERROR] Fix these Railway variables, then redeploy:\n  - ' + problems.join('\n  - '));
+    console.error('[BOOT ERROR] Fix these Railway settings, then redeploy:\n  - ' + problems.join('\n  - '));
     process.exit(1);
+  }
+  const mobile = (process.env.SUPERADMIN_MOBILE || '').replace(/\D/g, '');
+  if (process.env.SUPERADMIN_MOBILE && mobile.length !== 10) {
+    console.warn(`[BOOT WARNING] SUPERADMIN_MOBILE should be a 10-digit mobile number (got ${mobile.length} digits)`);
   }
 }
 
