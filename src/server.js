@@ -1,0 +1,128 @@
+'use strict';
+
+const path    = require('path');
+const express = require('express');
+const helmet  = require('helmet');
+const cors    = require('cors');
+const morgan  = require('morgan');
+const rateLimit = require('express-rate-limit');
+
+const { setDb } = require('./db/connection');
+const { initDb: openDb } = require('./db/init');
+const { autoSeedIfEmpty } = require('./db/seed');
+const routes        = require('./routes');
+const { startScheduler } = require('./services/scheduler');
+
+const app  = express();
+const PORT = process.env.PORT || 8080;
+const ENV  = process.env.NODE_ENV || 'development';
+
+// Railway (and most PaaS) put the app behind a single reverse proxy. Trusting
+// one hop lets express-rate-limit and req.ip see the real client IP instead of
+// the proxy's — without it every user would share one IP and be rate-limited
+// together.
+app.set('trust proxy', 1);
+
+// A crash-proof server must survive stray async errors instead of exiting.
+// Log loudly and keep serving; a single bad request should never take the
+// whole process down.
+process.on('unhandledRejection', (reason) => {
+  console.error('[UNHANDLED REJECTION]', reason && reason.stack ? reason.stack : reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[UNCAUGHT EXCEPTION]', err && err.stack ? err.stack : err);
+});
+
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc:    ["'self'"],
+      scriptSrc:     ["'self'", "'unsafe-inline'"],
+      scriptSrcAttr: ["'unsafe-inline'"],
+      styleSrc:      ["'self'", "'unsafe-inline'"],
+      imgSrc:        ["'self'", 'data:', 'blob:'],
+      connectSrc:    ["'self'"],
+    },
+  },
+}));
+
+app.use(cors());
+app.use(express.json({ limit: '3mb' })); // ID photos arrive as base64 (max 1.5 MB file)
+app.use(morgan(ENV === 'production' ? 'combined' : 'dev'));
+
+// Brute-force protection on credential endpoints. 20 attempts / 15 min / IP.
+// Successful logins are cheap; this only bites password-guessing loops.
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many attempts. Please try again in a few minutes.' },
+});
+app.use('/api/v1/auth/login',           authLimiter);
+app.use('/api/v1/auth/register',        authLimiter);
+app.use('/api/v1/auth/forgot-password', authLimiter);
+app.use('/api/v1/auth/reset-password',  authLimiter);
+
+app.use(express.static(path.join(__dirname, '..', 'public')));
+app.use('/api/v1', routes);
+
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
+});
+
+app.use((err, req, res, _next) => {
+  // A malformed JSON body is a client error, not a server fault — answer 400,
+  // not 500, and don't log it as an internal error.
+  if (err && (err.type === 'entity.parse.failed' || err instanceof SyntaxError) && 'body' in err) {
+    return res.status(400).json({ error: 'Invalid JSON in request body' });
+  }
+  // Oversized body → 413 rather than a generic 500.
+  if (err && err.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'Request body too large' });
+  }
+  // Business-rule errors from the money ledger (day closed, refund > deposit,
+  // duplicate payment, ...) are the user's to fix — answer 4xx with the reason.
+  if (err && err.isLedgerError) {
+    if (res.headersSent) return;
+    return res.status(err.status || 400).json({ error: err.message, code: err.code });
+  }
+  if (err && err.code === 'SQLITE_BUSY') {
+    if (res.headersSent) return;
+    return res.status(503).json({ error: 'Server busy — please retry' });
+  }
+  console.error('[ERROR]', err.message, err.stack);
+  if (res.headersSent) return;   // response already streaming (e.g. PDF export)
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+// Refuse to start in production without the secrets the app cannot work without.
+// A clear boot error in Railway logs beats a running app where every login fails.
+function checkRequiredEnv() {
+  if (ENV !== 'production') return;
+  const problems = [];
+  const jwt = process.env.JWT_SECRET;
+  if (!jwt || jwt.startsWith('CHANGE_ME') || jwt.length < 32) problems.push('JWT_SECRET missing or shorter than 32 characters');
+  const aes = process.env.AES_256_KEY;
+  if (!aes || !/^[0-9a-fA-F]{64}$/.test(aes)) problems.push('AES_256_KEY must be exactly 64 hex characters (openssl rand -hex 32)');
+  if (problems.length) {
+    console.error('[BOOT ERROR] Fix these Railway variables, then redeploy:\n  - ' + problems.join('\n  - '));
+    process.exit(1);
+  }
+}
+
+(async () => {
+  try {
+    checkRequiredEnv();
+    const db = openDb();
+    setDb(db);
+    autoSeedIfEmpty(db);
+    startScheduler();
+    app.listen(PORT, () => {
+      console.log(`[SERVER] DormBook v4.0 on port ${PORT} (${ENV})`);
+    });
+  } catch (err) {
+    console.error('[BOOT ERROR]', err.message, err.stack);
+    process.exit(1);
+  }
+})();

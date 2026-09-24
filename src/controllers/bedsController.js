@@ -1,0 +1,309 @@
+'use strict';
+
+const { v4: uuidv4 } = require('uuid');
+const { getDb }       = require('../db/connection');
+const { writeAudit }  = require('../middleware/auditLog');
+
+// Ensure new columns exist — runs once, idempotent
+let _migrated = false;
+function ensureBedColumns(db) {
+  if (_migrated) return;
+  try {
+    const cols = db.prepare("SELECT name FROM pragma_table_info('beds')").all().map(c => c.name);
+    if (!cols.includes('daily_rate_paise')) db.exec("ALTER TABLE beds ADD COLUMN daily_rate_paise INTEGER NOT NULL DEFAULT 0");
+    if (!cols.includes('base_rate_paise')) db.exec("ALTER TABLE beds ADD COLUMN base_rate_paise INTEGER NOT NULL DEFAULT 0");
+  } catch(e) { console.warn('[MIGRATION] Bed columns:', e.message); }
+  _migrated = true;
+}
+
+/** GET /api/v1/beds — flat list with resident + hierarchy info */
+function listBeds(req, res) {
+  const db = getDb();
+  ensureBedColumns(db);
+  const { status, floor_id, room_id } = req.query;
+  let q = `
+    SELECT b.*, r.full_name as resident_name, r.id as resident_id,
+           r.monthly_rent_paise, r.rate_paise, r.rate_type,
+           r.deposit_paise, r.expected_checkout, r.check_in_date,
+           rm.room_number, rm.room_type, f.label as floor_label, f.floor_number
+    FROM beds b
+    LEFT JOIN residents r ON r.bed_id = b.id AND r.status = 'active'
+    LEFT JOIN rooms rm ON rm.id = b.room_id
+    LEFT JOIN floors f ON f.id = rm.floor_id
+    WHERE b.property_id = ?
+  `;
+  const params = [req.user.property_id];
+  if (status)   { q += ' AND b.status = ?'; params.push(status); }
+  if (floor_id) { q += ' AND rm.floor_id = ?'; params.push(floor_id); }
+  if (room_id)  { q += ' AND b.room_id = ?'; params.push(room_id); }
+  q += ' ORDER BY f.floor_number, length(rm.room_number), rm.room_number, b.bed_label';
+  return res.json(db.prepare(q).all(...params));
+}
+
+/** GET /api/v1/beds/:id — single bed with resident detail */
+function getBed(req, res) {
+  const db = getDb();
+  const bed = db.prepare(`
+    SELECT b.*, rm.room_number, rm.room_type, f.label as floor_label, f.floor_number,
+           r.id as resident_id, r.full_name as resident_name, r.mobile as resident_mobile,
+           r.monthly_rent_paise, r.rate_paise, r.rate_type, r.deposit_paise,
+           r.check_in_date, r.expected_checkout
+    FROM beds b
+    LEFT JOIN rooms rm ON rm.id = b.room_id
+    LEFT JOIN floors f ON f.id = rm.floor_id
+    LEFT JOIN residents r ON r.bed_id = b.id AND r.status = 'active'
+    WHERE b.id = ? AND b.property_id = ?
+  `).get(req.params.id, req.user.property_id);
+  if (!bed) return res.status(404).json({ error: 'Bed not found' });
+  return res.json(bed);
+}
+
+/**
+ * PATCH /api/v1/beds/:id/status
+ *
+ * FIX L-02: 'occupied' is no longer an allowed target status through this endpoint.
+ * The 'occupied' status is exclusively managed by checkIn(). Allowing manual setting
+ * of 'occupied' with no resident attached corrupts occupancy data and capacity reporting.
+ * If a bed is mis-tagged as occupied (e.g., after a data migration issue), an owner
+ * should set it to 'available' or 'cleaning' to recover it.
+ */
+function updateBedStatus(req, res) {
+  const db = getDb();
+  const { status, notes } = req.body;
+  // FIX L-02: 'occupied' removed from valid manual transitions
+  const VALID = ['available', 'cleaning', 'reserved', 'pending'];
+  if (!VALID.includes(status)) {
+    return res.status(400).json({ error: `status must be one of: ${VALID.join(', ')} — 'occupied' is set automatically on check-in` });
+  }
+  const bed = db.prepare('SELECT * FROM beds WHERE id = ? AND property_id = ?')
+    .get(req.params.id, req.user.property_id);
+  if (!bed) return res.status(404).json({ error: 'Bed not found' });
+  if (bed.status === 'occupied') {
+    const hasActive = db.prepare(
+      "SELECT COUNT(*) as c FROM residents WHERE bed_id = ? AND status = 'active'"
+    ).get(req.params.id);
+    if (hasActive.c > 0) {
+      return res.status(409).json({ error: 'Cannot change occupied bed with active resident. Use checkout.' });
+    }
+  }
+  const cleaningAt = status === 'cleaning' ? "datetime('now')" : 'NULL';
+  db.prepare(`UPDATE beds SET status=?, cleaning_started_at=${cleaningAt}, updated_at=datetime('now') WHERE id=?`)
+    .run(status, req.params.id);
+  writeAudit({ propertyId: req.user.property_id, userId: req.user.id,
+    action: 'BED_STATUS_UPDATE', entityType: 'beds', entityId: req.params.id,
+    snapshot: { from: bed.status, to: status, notes }, ip: req.ip });
+  return res.json(db.prepare('SELECT * FROM beds WHERE id = ?').get(req.params.id));
+}
+
+/** PATCH /api/v1/beds/:id/rate — owner sets price for ONE bed */
+function updateBedRate(req, res) {
+  const db = getDb();
+  const propertyId = req.user.property_id;
+  const { daily_rate_paise } = req.body;
+  if (daily_rate_paise === undefined || daily_rate_paise === null) {
+    return res.status(400).json({ error: 'daily_rate_paise is required' });
+  }
+  const rateNum = parseFloat(daily_rate_paise);
+  if (!isFinite(rateNum) || rateNum < 0) {
+    return res.status(400).json({ error: 'daily_rate_paise must be a number ≥ 0' });
+  }
+  const rate = Math.round(rateNum);
+  const bed = db.prepare('SELECT * FROM beds WHERE id = ? AND property_id = ?')
+    .get(req.params.id, propertyId);
+  if (!bed) return res.status(404).json({ error: 'Bed not found' });
+
+  db.prepare(`UPDATE beds SET daily_rate_paise=?, base_rate_paise=?, updated_at=datetime('now') WHERE id=?`)
+    .run(rate, rate, req.params.id);
+  writeAudit({ propertyId, userId: req.user.id,
+    action: 'BED_RATE_UPDATE', entityType: 'beds', entityId: req.params.id,
+    amountPaise: rate, snapshot: { old: bed.daily_rate_paise, new: rate }, ip: req.ip });
+  return res.json(db.prepare('SELECT * FROM beds WHERE id = ?').get(req.params.id));
+}
+
+/** PATCH /api/v1/beds/bulk-rate — owner sets rate for multiple beds at once */
+function bulkUpdateBedRate(req, res) {
+  const db = getDb();
+  const propertyId = req.user.property_id;
+  const { bed_ids, daily_rate_paise } = req.body;
+  if (!Array.isArray(bed_ids) || bed_ids.length === 0) {
+    return res.status(400).json({ error: 'bed_ids must be a non-empty array' });
+  }
+  const rateNum = parseFloat(daily_rate_paise);
+  if (!isFinite(rateNum) || rateNum < 0) {
+    return res.status(400).json({ error: 'daily_rate_paise must be a number ≥ 0' });
+  }
+  const rate = Math.round(rateNum);
+
+  const placeholders = bed_ids.map(() => '?').join(',');
+  const beds = db.prepare(
+    `SELECT id FROM beds WHERE id IN (${placeholders}) AND property_id = ?`
+  ).all(...bed_ids, propertyId);
+  if (beds.length === 0) return res.status(404).json({ error: 'No matching beds found' });
+
+  db.transaction(() => {
+    beds.forEach(b => {
+      db.prepare(`UPDATE beds SET daily_rate_paise=?, base_rate_paise=?, updated_at=datetime('now') WHERE id=?`)
+        .run(rate, rate, b.id);
+    });
+  })();
+  writeAudit({ propertyId, userId: req.user.id,
+    action: 'BED_RATE_BULK_UPDATE', entityType: 'beds', entityId: beds.map(b=>b.id).join(','),
+    amountPaise: rate, snapshot: { count: beds.length, rate }, ip: req.ip });
+  return res.json({ message: `Rate updated for ${beds.length} bed(s)`, updated: beds.length, daily_rate_paise: rate });
+}
+
+/** POST /api/v1/beds */
+function createBed(req, res) {
+  const db = getDb();
+  const propertyId = req.user.property_id;
+  const { room_id, daily_rate_paise = 0 } = req.body;
+  const bedLabel = req.body.bed_label != null ? String(req.body.bed_label).trim() : '';
+  if (!room_id || !bedLabel) return res.status(400).json({ error: 'room_id and bed_label are required' });
+  const room = db.prepare('SELECT * FROM rooms WHERE id = ? AND property_id = ?').get(room_id, propertyId);
+  if (!room) return res.status(404).json({ error: 'Room not found' });
+  const rateNum = parseFloat(daily_rate_paise);
+  const rate = isFinite(rateNum) && rateNum >= 0 ? Math.round(rateNum) : 0;
+  const id = uuidv4();
+  const now = new Date().toISOString();
+  db.prepare(`
+    INSERT INTO beds (id, room_id, property_id, bed_label, daily_rate_paise, base_rate_paise, status, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, 'available', ?, ?)
+  `).run(id, room_id, propertyId, bedLabel, rate, rate, now, now);
+  return res.status(201).json(db.prepare('SELECT * FROM beds WHERE id = ?').get(id));
+}
+
+/** GET /api/v1/floors — hierarchy: floors → rooms → bed count */
+function listFloors(req, res) {
+  const db = getDb();
+  const floors = db.prepare('SELECT * FROM floors WHERE property_id = ? ORDER BY floor_number').all(req.user.property_id);
+  const rooms  = db.prepare('SELECT * FROM rooms WHERE property_id = ? ORDER BY length(room_number), room_number').all(req.user.property_id);
+  const beds   = db.prepare(`
+    SELECT b.id, b.room_id, b.bed_label, b.status, b.daily_rate_paise,
+           r.full_name as resident_name, r.id as resident_id
+    FROM beds b LEFT JOIN residents r ON r.bed_id = b.id AND r.status = 'active'
+    WHERE b.property_id = ?
+  `).all(req.user.property_id);
+
+  const result = floors.map(f => ({
+    ...f,
+    rooms: rooms.filter(rm => rm.floor_id === f.id).map(rm => ({
+      ...rm,
+      beds: beds.filter(b => b.room_id === rm.id),
+      total_beds: beds.filter(b => b.room_id === rm.id).length,
+      occupied: beds.filter(b => b.room_id === rm.id && b.status === 'occupied').length,
+    })),
+  }));
+  return res.json(result);
+}
+
+/** POST /api/v1/floors */
+function addFloor(req, res) {
+  const db = getDb();
+  const propertyId = req.user.property_id;
+  // floor_number can legitimately be 0 (ground floor), so test for presence,
+  // not truthiness. Coerce label to a string before trim() so a numeric label
+  // cannot throw and 500 the request.
+  const floorNum = Number(req.body.floor_number);
+  const label    = req.body.label != null ? String(req.body.label).trim() : '';
+  if (!Number.isInteger(floorNum) || floorNum < 0) {
+    return res.status(400).json({ error: 'floor_number must be a non-negative integer' });
+  }
+  if (!label) return res.status(400).json({ error: 'label is required' });
+
+  const existing = db.prepare('SELECT id FROM floors WHERE property_id = ? AND floor_number = ?').get(propertyId, floorNum);
+  if (existing) return res.status(409).json({ error: `Floor ${floorNum} already exists` });
+
+  const id = uuidv4();
+  db.prepare("INSERT INTO floors (id, property_id, floor_number, label, created_at) VALUES (?,?,?,?,datetime('now'))")
+    .run(id, propertyId, floorNum, label);
+  writeAudit({ propertyId, userId: req.user.id, action: 'FLOOR_CREATED',
+    entityType: 'floors', entityId: id, snapshot: { floor_number: floorNum, label }, ip: req.ip });
+  return res.status(201).json(db.prepare('SELECT * FROM floors WHERE id = ?').get(id));
+}
+
+/** POST /api/v1/rooms */
+function addRoom(req, res) {
+  const db = getDb();
+  const propertyId = req.user.property_id;
+  const { floor_id, room_type = 'shared' } = req.body;
+  // Coerce room_number to a string — clients often send it as a JSON number
+  // (e.g. 101), and calling .trim() on a number would throw and 500.
+  const roomNumber = req.body.room_number != null ? String(req.body.room_number).trim() : '';
+  if (!floor_id || !roomNumber) return res.status(400).json({ error: 'floor_id and room_number are required' });
+
+  const floor = db.prepare('SELECT * FROM floors WHERE id = ? AND property_id = ?').get(floor_id, propertyId);
+  if (!floor) return res.status(404).json({ error: 'Floor not found' });
+
+  const TYPES = ['shared', 'private', 'dormitory'];
+  if (!TYPES.includes(room_type)) return res.status(400).json({ error: `room_type must be: ${TYPES.join(', ')}` });
+
+  const existing = db.prepare('SELECT id FROM rooms WHERE property_id = ? AND room_number = ?').get(propertyId, roomNumber);
+  if (existing) return res.status(409).json({ error: `Room ${roomNumber} already exists` });
+
+  const id = uuidv4();
+  db.prepare("INSERT INTO rooms (id, floor_id, property_id, room_number, room_type, created_at) VALUES (?,?,?,?,?,datetime('now'))")
+    .run(id, floor_id, propertyId, roomNumber, room_type);
+  writeAudit({ propertyId, userId: req.user.id, action: 'ROOM_CREATED',
+    entityType: 'rooms', entityId: id, snapshot: { floor_id, room_number: roomNumber, room_type }, ip: req.ip });
+  return res.status(201).json(db.prepare('SELECT * FROM rooms WHERE id = ?').get(id));
+}
+
+/** A, B, ... Z, AA, AB, ... */
+function bunkerLetter(i) {
+  let s = '';
+  i += 1;
+  while (i > 0) { const r = (i - 1) % 26; s = String.fromCharCode(65 + r) + s; i = Math.floor((i - 1) / 26); }
+  return s;
+}
+
+/**
+ * POST /api/v1/floors/:id/bunkers
+ * Dormitory setup in one step: N bunkers × M beds on a floor.
+ * Bunkers are named <floor><letter> (0A, 0B, ...) and beds <floor><letter><n>
+ * (0A1, 0A2, 0B1, ...). New bunkers continue after the floor's existing letters.
+ */
+function addBunkers(req, res) {
+  const db = getDb();
+  const propertyId = req.user.property_id;
+  const floor = db.prepare('SELECT * FROM floors WHERE id = ? AND property_id = ?').get(req.params.id, propertyId);
+  if (!floor) return res.status(404).json({ error: 'Floor not found' });
+
+  const count = Number(req.body.bunkers);
+  const perBunker = req.body.beds_per_bunker === undefined ? 2 : Number(req.body.beds_per_bunker);
+  const rate = req.body.daily_rate_paise === undefined ? 0 : Number(req.body.daily_rate_paise);
+  if (!Number.isInteger(count) || count < 1 || count > 100) return res.status(400).json({ error: 'Number of bunkers must be 1–100' });
+  if (!Number.isInteger(perBunker) || perBunker < 1 || perBunker > 6) return res.status(400).json({ error: 'Beds per bunker must be 1–6' });
+  if (!Number.isInteger(rate) || rate < 0) return res.status(400).json({ error: 'Rate must be 0 or more' });
+
+  const prefix = String(floor.floor_number);
+  const existing = db.prepare('SELECT room_number FROM rooms WHERE floor_id = ?').all(floor.id).map((r) => r.room_number);
+  const taken = new Set(db.prepare('SELECT room_number FROM rooms WHERE property_id = ?').all(propertyId).map((r) => r.room_number));
+  const created = [];
+  const now = new Date().toISOString();
+
+  db.transaction(() => {
+    let i = 0;
+    while (created.length < count) {
+      const name = prefix + bunkerLetter(i++);
+      if (taken.has(name) || existing.includes(name)) continue;
+      const roomId = uuidv4();
+      db.prepare("INSERT INTO rooms (id, floor_id, property_id, room_number, room_type, created_at) VALUES (?,?,?,?,'dormitory',?)")
+        .run(roomId, floor.id, propertyId, name, now);
+      const beds = [];
+      for (let n = 1; n <= perBunker; n++) {
+        const label = `${name}${n}`;
+        db.prepare(`INSERT INTO beds (id, room_id, property_id, bed_label, daily_rate_paise, base_rate_paise, status, created_at, updated_at)
+          VALUES (?,?,?,?,?,?,'available',?,?)`).run(uuidv4(), roomId, propertyId, label, rate, rate, now, now);
+        beds.push(label);
+      }
+      taken.add(name);
+      created.push({ bunker: name, beds });
+    }
+  })();
+
+  writeAudit({ propertyId, userId: req.user.id, action: 'BUNKERS_CREATED', entityType: 'floors', entityId: floor.id,
+    snapshot: { bunkers: created.map((c) => c.bunker), beds_per_bunker: perBunker, rate }, ip: req.ip });
+  return res.status(201).json({ floor: floor.label, created, total_beds: created.length * perBunker });
+}
+
+module.exports = { listBeds, getBed, updateBedStatus, updateBedRate, bulkUpdateBedRate, createBed, listFloors, addFloor, addRoom, addBunkers, bunkerLetter };

@@ -1,0 +1,38 @@
+{
+  "name": "dormbook",
+  "version": "2.0.0",
+  "description": "DormBook — PG & Hostel Management System (Production)",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "NODE_ENV=development node --watch src/server.js",
+    "seed": "node src/db/seed.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "better-sqlite3": "^12.11.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "exceljs": "^4.4.0",
+    "express": "^4.18.3",
+    "express-rate-limit": "^7.2.0",
+    "helmet": "^7.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "morgan": "^1.10.0",
+    "node-cron": "^4.6.0",
+    "pdfkit": "^0.20.2",
+    "uuid": "^9.0.1"
+  },
+  "keywords": [
+    "pg",
+    "hostel",
+    "management",
+    "dorm"
+  ],
+  "license": "UNLICENSED",
+  "private": true
+}

@@ -1,0 +1,11 @@
+[phases.setup]
+nixPkgs = ["nodejs_22"]
+
+[phases.install]
+# better-sqlite3 12.x ships a ready-made binary for Node 22, so no compiler is
+# needed. (The old step re-ran node-gyp and hid failures with `|| echo`; a
+# failed rebuild deletes the working binary and the app crashes on boot.)
+cmds = ["npm ci --omit=dev"]
+
+[start]
+cmd = "node src/server.js"

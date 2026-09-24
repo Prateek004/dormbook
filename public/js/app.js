@@ -1,0 +1,2084 @@
+'use strict';
+/* ============================================================
+   DormBook v3 — Frontend SPA  (SaaS edition)
+   API base: /api/v1
+   All monetary display: paise ÷ 100 = rupees
+   ============================================================ */
+
+// ── Service Worker registration ──────────────────────────────
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js')
+      .then(reg => {
+        console.log('[SW] Registered:', reg.scope);
+        navigator.serviceWorker.addEventListener('message', e => {
+          if (e.data?.type === 'SYNC_COMPLETE') {
+            toast(`Synced ${e.data.replayed} offline action(s)`, 'success');
+            refreshCurrentPage();
+          }
+        });
+      })
+      .catch(err => console.warn('[SW] Registration failed:', err.message));
+  });
+}
+
+// ── Offline indicator ────────────────────────────────────────
+window.addEventListener('online',  () => document.getElementById('offline-indicator')?.classList.add('hidden'));
+window.addEventListener('offline', () => document.getElementById('offline-indicator')?.classList.remove('hidden'));
+
+// ── State ────────────────────────────────────────────────────
+const STATE = { token: null, user: null, currentPage: null };
+
+// ── API helper ───────────────────────────────────────────────
+function newIdemKey() {
+  if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+  return Date.now().toString(36) + Math.random().toString(36).slice(2);
+}
+
+async function api(method, path, body) {
+  const opts = {
+    method,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(STATE.token ? { Authorization: `Bearer ${STATE.token}` } : {}),
+      // one key per click: a retried request can never record the same payment twice
+      ...(method !== 'GET' ? { 'Idempotency-Key': newIdemKey() } : {}),
+    },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  };
+  const res = await fetch(`/api/v1${path}`, opts);
+  const data = await res.json().catch(() => ({}));
+  if (res.status === 401 && STATE.token && !path.startsWith('/auth/login')) {
+    // Session no longer valid (expired, server secret changed, or database reset).
+    sessionStorage.clear();
+    STATE.token = null; STATE.user = null;
+    showScreen('login-screen');
+    toast('Your session has ended — please sign in again', 'warning', 5000);
+  }
+  if (!res.ok) {
+    const msg = data.error || (res.status >= 500 ? 'Server is not reachable right now. Please try again in a minute.' : `Request failed (${res.status})`);
+    throw Object.assign(new Error(msg), { status: res.status, data });
+  }
+  return data;
+}
+
+// Today's date in India (YYYY-MM-DD). toISOString() is UTC, which is still
+// "yesterday" before 05:30 IST — so forms defaulted to the wrong date at night.
+function todayIST() { return new Date(Date.now() + 330 * 60000).toISOString().slice(0, 10); }
+// HTML-escape any user-entered text before putting it in innerHTML.
+function h(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c])); }
+function rupees(paise) { const v = Math.round(paise || 0); const t = `₹${(Math.abs(v) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`; return v < 0 ? `−${t}` : t; }
+function fmtDate(d) { return d ? new Date(d).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : '—'; }
+function esc(s) { return String(s || '').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'&quot;'); }
+
+// ── Toast ────────────────────────────────────────────────────
+function toast(msg, type = 'info', duration = 3500) {
+  const tc = document.getElementById('toast-container');
+  if (!tc) return;
+  const el = document.createElement('div');
+  el.className = `toast ${type}`;
+  el.textContent = msg;
+  tc.appendChild(el);
+  setTimeout(() => { el.style.opacity = '0'; el.style.transition = 'opacity .3s'; setTimeout(() => el.remove(), 300); }, duration);
+}
+
+// ── Modal ────────────────────────────────────────────────────
+function openModal(title, bodyHtml, { wide } = {}) {
+  document.getElementById('modal-title').textContent = title;
+  document.getElementById('modal-body').innerHTML = bodyHtml;
+  document.getElementById('modal').style.maxWidth = wide ? '720px' : '520px';
+  document.getElementById('modal-overlay').classList.remove('hidden');
+}
+function closeModal() { document.getElementById('modal-overlay').classList.add('hidden'); }
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('modal-close').addEventListener('click', closeModal);
+  document.getElementById('modal-overlay').addEventListener('click', e => { if (e.target === document.getElementById('modal-overlay')) closeModal(); });
+});
+
+// ── Navigation ───────────────────────────────────────────────
+// Each page shows only if the signed-in user has one of its permissions.
+const PAGES = [
+  { id: 'dashboard', label: '🏠 Today' },
+  { id: 'checkin',   label: '✅ Check In',     perms: ['checkin'] },
+  { id: 'residents', label: '👥 Residents' },
+  { id: 'beds',      label: '🛏 Beds' },
+  { id: 'payments',  label: '💳 Payments',     perms: ['payments', 'approvals'] },
+  { id: 'reconcile', label: '🗃 Cash Close',   perms: ['cash_close'] },
+  { id: 'bookings',  label: '📌 Bookings',     perms: ['bookings'] },
+  { id: 'addons',    label: '➕ Add-ons',      perms: ['addons'] },
+  { id: 'expenses',  label: '📋 Expenses',     perms: ['expenses'] },
+  { id: 'reports',   label: '📊 Reports',      perms: ['reports_daily', 'reports_finance'] },
+  { id: 'daily',     label: '📅 Daily View',   perms: ['reports_daily'] },
+  { id: 'staff',     label: '👤 Users & Access', perms: ['staff'] },
+  { id: 'feedback',  label: '⭐ Feedback',     perms: ['approvals'] },
+  { id: 'catalog',   label: '📦 Add-on Catalog', perms: ['settings'] },
+  { id: 'audit',     label: '🔍 Audit Log',    perms: ['audit'] },
+  { id: 'settings',  label: '⚙️ Settings',     perms: ['settings'] },
+];
+
+/** Does the signed-in user have this permission? */
+function can(perm) {
+  const u = STATE.user;
+  if (!u) return false;
+  if (u.role === 'owner' || u.role === 'superadmin') return true;
+  return Array.isArray(u.permissions) && u.permissions.includes(perm);
+}
+
+function buildNav() {
+  const pages = PAGES.filter(p => !p.perms || p.perms.some(can));
+  const nav   = document.getElementById('nav-list');
+  nav.innerHTML = pages.map(p => `
+    <li><a href="#" data-page="${p.id}">${h(p.label)}</a></li>
+  `).join('');
+  nav.querySelectorAll('[data-page]').forEach(a =>
+    a.addEventListener('click', e => { e.preventDefault(); navigate(a.dataset.page); closeSidebar(); })
+  );
+}
+
+function navigate(page) {
+  STATE.currentPage = page;
+  document.querySelectorAll('.nav-list a').forEach(a =>
+    a.classList.toggle('active', a.dataset.page === page)
+  );
+  document.getElementById('page-title').textContent = titleFor(page);
+  document.getElementById('header-actions').innerHTML = '';
+  renderPage(page);
+}
+
+function titleFor(page) {
+  const map = { dashboard:'Today', staff:'Users & Access', daily:'Daily View', beds:'Beds', checkin:'Check In', residents:'Residents',
+    payments:'Payments', addons:'Add-on Charges', bookings:'Bookings', reconcile:'Cash Reconciliation',
+    expenses:'Expenses', reports:'Reports', staff:'Users & Access', feedback:'Tenant Feedback',
+    catalog:'Add-on Catalog', audit:'Audit Log', settings:'Property Settings', admin:'Admin Panel' };
+  return map[page] || page;
+}
+
+function refreshCurrentPage() { if (STATE.currentPage) renderPage(STATE.currentPage); }
+
+function closeSidebar() { document.getElementById('sidebar').classList.remove('open'); }
+
+// ── Screen helper ────────────────────────────────────────────
+function showScreen(id) {
+  ['login-screen', 'register-screen', 'forgot-screen', 'main-app', 'loading-screen'].forEach(s => {
+    const el = document.getElementById(s);
+    if (el) el.classList.add('hidden');
+  });
+  const target = document.getElementById(id);
+  if (target) target.classList.remove('hidden');
+}
+
+// ── Auth ─────────────────────────────────────────────────────
+async function init() {
+  const loadingTimer = setTimeout(() => showScreen('login-screen'), 4000);
+  try {
+    const token = sessionStorage.getItem('db_token');
+    const user  = JSON.parse(sessionStorage.getItem('db_user') || 'null');
+    if (token && user) {
+      STATE.token = token;
+      STATE.user  = user;
+      try {
+        const me = await api('GET', '/auth/me');
+        if (me && me.user) { STATE.user = me.user; sessionStorage.setItem('db_user', JSON.stringify(me.user)); } // fresh permissions
+        clearTimeout(loadingTimer);
+        showApp();
+      } catch {
+        sessionStorage.clear();
+        STATE.token = null;
+        STATE.user  = null;
+        clearTimeout(loadingTimer);
+        showScreen('login-screen');
+      }
+    } else {
+      clearTimeout(loadingTimer);
+      showScreen('login-screen');
+    }
+  } catch {
+    clearTimeout(loadingTimer);
+    showScreen('login-screen');
+  }
+}
+
+// ── Login ────────────────────────────────────────────────────
+let _loginListenerAttached = false;
+document.addEventListener('DOMContentLoaded', () => {
+  // Login
+  if (!_loginListenerAttached) {
+    document.getElementById('login-btn')?.addEventListener('click', handleLogin);
+    document.getElementById('login-form')?.addEventListener('keydown', e => { if (e.key === 'Enter') handleLogin(e); });
+    _loginListenerAttached = true;
+  }
+
+  // Screen navigation links
+  document.getElementById('goto-register')?.addEventListener('click', e => { e.preventDefault(); showScreen('register-screen'); });
+  document.getElementById('goto-forgot')?.addEventListener('click',   e => { e.preventDefault(); showScreen('forgot-screen'); });
+  document.getElementById('goto-login')?.addEventListener('click',    e => { e.preventDefault(); showScreen('login-screen'); });
+  document.getElementById('goto-login-2')?.addEventListener('click',  e => { e.preventDefault(); showScreen('login-screen'); });
+
+  // Register form
+  document.getElementById('register-btn')?.addEventListener('click', handleRegister);
+  document.getElementById('register-form')?.addEventListener('keydown', e => { if (e.key === 'Enter') handleRegister(e); });
+
+  // Forgot password — step 1 (send OTP)
+  document.getElementById('forgot-send-btn')?.addEventListener('click', handleForgotSend);
+
+  // Forgot password — step 2 (reset with OTP)
+  document.getElementById('forgot-reset-btn')?.addEventListener('click', handleForgotReset);
+});
+
+async function handleLogin(e) {
+  e.preventDefault();
+  const btn = document.getElementById('login-btn');
+  const err = document.getElementById('login-error');
+  err.classList.add('hidden');
+  btn.disabled = true;
+  btn.textContent = 'Signing in…';
+  try {
+    const data = await api('POST', '/auth/login', {
+      email:    document.getElementById('login-email').value.trim(),
+      password: document.getElementById('login-password').value,
+    });
+    STATE.token = data.token;
+    STATE.user  = data.user;
+    sessionStorage.setItem('db_token', data.token);
+    sessionStorage.setItem('db_user',  JSON.stringify(data.user));
+    showApp();
+  } catch (ex) {
+    const msg = ex.status === 0
+      ? 'Cannot reach server. Check your connection.'
+      : (ex.message || 'Login failed');
+    err.textContent = msg;
+    err.classList.remove('hidden');
+    btn.disabled = false;
+    btn.textContent = 'Sign In';
+  }
+}
+
+async function handleRegister(e) {
+  e?.preventDefault();
+  const btn = document.getElementById('register-btn');
+  const err = document.getElementById('register-error');
+  err.classList.add('hidden');
+  btn.disabled = true;
+  btn.textContent = 'Creating account…';
+  try {
+    const data = await api('POST', '/auth/register', {
+      business_name: document.getElementById('reg-business').value.trim(),
+      owner_name:    document.getElementById('reg-name').value.trim(),
+      mobile:        document.getElementById('reg-mobile').value.trim(),
+      email:         document.getElementById('reg-email').value.trim() || undefined,
+      password:      document.getElementById('reg-password').value,
+      pg_name:       document.getElementById('reg-pg-name').value.trim(),
+      city:          document.getElementById('reg-city').value.trim() || undefined,
+    });
+    STATE.token = data.token;
+    STATE.user  = data.user;
+    sessionStorage.setItem('db_token', data.token);
+    sessionStorage.setItem('db_user',  JSON.stringify(data.user));
+    toast(`Welcome, ${h(data.user.name)}! Your 30-day trial has started.`, 'success', 6000);
+    showApp();
+  } catch (ex) {
+    err.textContent = ex.message || 'Registration failed';
+    err.classList.remove('hidden');
+    btn.disabled = false;
+    btn.textContent = 'Create Account';
+  }
+}
+
+// forgot step state
+let _forgotMobile = '';
+
+async function handleForgotSend(e) {
+  e?.preventDefault();
+  const btn = document.getElementById('forgot-send-btn');
+  const err = document.getElementById('forgot-error');
+  err.classList.add('hidden');
+  const mobile = document.getElementById('forgot-mobile').value.trim();
+  if (!mobile) { err.textContent = 'Enter your registered mobile number'; err.classList.remove('hidden'); return; }
+  btn.disabled = true;
+  btn.textContent = 'Sending…';
+  try {
+    await api('POST', '/auth/forgot-password', { mobile });
+    _forgotMobile = mobile;
+    // Show step 2
+    document.getElementById('forgot-step-1').classList.add('hidden');
+    document.getElementById('forgot-step-2').classList.remove('hidden');
+    toast('OTP sent to your WhatsApp', 'success');
+  } catch (ex) {
+    err.textContent = ex.message || 'Failed to send OTP';
+    err.classList.remove('hidden');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Send OTP';
+  }
+}
+
+async function handleForgotReset(e) {
+  e?.preventDefault();
+  const btn = document.getElementById('forgot-reset-btn');
+  const err = document.getElementById('forgot-reset-error');
+  err.classList.add('hidden');
+  const otp      = document.getElementById('forgot-otp').value.trim();
+  const password = document.getElementById('forgot-new-password').value;
+  if (!otp || !password) { err.textContent = 'Enter OTP and new password'; err.classList.remove('hidden'); return; }
+  btn.disabled = true;
+  btn.textContent = 'Resetting…';
+  try {
+    await api('POST', '/auth/reset-password', { mobile: _forgotMobile, otp, new_password: password });
+    toast('Password reset! Please log in.', 'success');
+    showScreen('login-screen');
+  } catch (ex) {
+    err.textContent = ex.message || 'Reset failed';
+    err.classList.remove('hidden');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Reset Password';
+  }
+}
+
+function showApp() {
+  showScreen('main-app');
+  document.getElementById('user-badge').textContent = `${h(STATE.user.name)} · ${STATE.user.role}`;
+  // Remove old listeners before adding (guard against double-attach after login → logout → login)
+  const logoutBtn = document.getElementById('logout-btn');
+  const newLogout = logoutBtn.cloneNode(true);
+  logoutBtn.parentNode.replaceChild(newLogout, logoutBtn);
+  newLogout.addEventListener('click', logout);
+
+  document.getElementById('menu-toggle').addEventListener('click', () => {
+    document.getElementById('sidebar').classList.toggle('open');
+  });
+
+  // Superadmin gets its own nav + page
+  if (STATE.user.role === 'superadmin') {
+    document.getElementById('nav-list').innerHTML = `
+      <li><a href="#" data-page="admin" class="active">👑 Admin Panel</a></li>
+    `;
+    document.getElementById('nav-list').querySelector('[data-page=admin]').addEventListener('click', e => {
+      e.preventDefault(); navigate('admin'); closeSidebar();
+    });
+    navigate('admin');
+    if (!navigator.onLine) document.getElementById('offline-indicator')?.classList.remove('hidden');
+    return;
+  }
+
+  buildNav();
+  navigate('dashboard');
+  if (!navigator.onLine) document.getElementById('offline-indicator')?.classList.remove('hidden');
+}
+
+function logout() {
+  sessionStorage.clear();
+  STATE.token = null;
+  STATE.user  = null;
+  location.reload();
+}
+
+// ── Pages ────────────────────────────────────────────────────
+async function renderPage(page) {
+  const el = document.getElementById('page-content');
+  el.innerHTML = '<div class="empty-state"><div class="loading-spinner" style="margin:0 auto"></div></div>';
+  try {
+    switch (page) {
+      case 'dashboard': await renderDashboard(el); break;
+      case 'beds':      await renderBeds(el);      break;
+      case 'checkin':   await renderCheckin(el);   break;
+      case 'residents': await renderResidents(el); break;
+      case 'payments':  await renderPayments(el);  break;
+      case 'addons':    await renderAddons(el);    break;
+      case 'bookings':  await renderBookings(el);  break;
+      case 'reconcile': await renderReconcile(el); break;
+      case 'expenses':  await renderExpenses(el);  break;
+      case 'reports':   await renderReports(el);   break;
+      case 'daily':     await renderDaily(el);     break;
+      case 'staff':     await renderStaff(el);     break;
+      case 'feedback':  await renderFeedback(el);  break;
+      case 'catalog':   await renderCatalog(el);   break;
+      case 'audit':     await renderAudit(el);     break;
+      case 'settings':  await renderSettings(el);  break;
+      case 'admin':     await renderAdminPanel(el); break;
+      default:          el.innerHTML = '<div class="empty-state"><p>Page not found</p></div>';
+    }
+  } catch (ex) {
+    el.innerHTML = `<div class="error-msg">Failed to load: ${ex.message}</div>`;
+  }
+}
+
+// ── Dashboard ────────────────────────────────────────────────
+async function renderDashboard(el) {
+  const d = await api('GET', '/dashboard/today');
+  const t = d.tasks;
+  const b = d.beds;
+  const occ = b.total ? Math.round((b.occupied * 100) / b.total) : 0;
+  const task = (icon, title, count, body, cls = '') => `
+    <div class="task ${count ? cls : 'done'}">
+      <div class="task-head"><span class="task-icon">${icon}</span><strong>${title}</strong><span class="task-count">${count}</span></div>
+      ${count ? `<div class="task-body">${body}</div>` : '<div class="task-body text-muted">Nothing to do ✓</div>'}
+    </div>`;
+  const row = (main, sub, btn) => `<div class="task-row"><div><div class="td-name">${main}</div><div class="td-small">${sub}</div></div>${btn || ''}</div>`;
+
+  el.innerHTML = `
+    <div class="kpis">
+      <div class="kpi"><span>Occupancy</span><strong>${occ}%</strong><em>${b.occupied} of ${b.total} beds</em></div>
+      <div class="kpi"><span>Vacant beds</span><strong>${b.available}</strong><em>${b.reserved} on hold · ${b.cleaning} cleaning</em></div>
+      ${d.collected_today_paise !== undefined ? `<div class="kpi"><span>Collected today</span><strong>${rupees(d.collected_today_paise)}</strong><em>cash, UPI and card</em></div>` : ''}
+      ${t.collect_dues ? `<div class="kpi ${t.collect_dues.total_paise ? 'bad' : ''}"><span>Dues pending</span><strong>${rupees(t.collect_dues.total_paise)}</strong><em>${t.collect_dues.count} residents</em></div>` : ''}
+    </div>
+
+    <div class="quick btn-group mb-20">
+      ${can('checkin') ? `<button class="btn btn-primary" onclick="navigate('checkin')">✅ Check In</button>` : ''}
+      ${can('checkout') ? `<button class="btn btn-outline" onclick="navigate('residents')">🚪 Check Out</button>` : ''}
+      ${can('payments') ? `<button class="btn btn-outline" onclick="navigate('payments')">💳 Take Payment</button>` : ''}
+      ${can('cash_close') ? `<button class="btn btn-outline" onclick="navigate('reconcile')">🗃 Close Cash</button>` : ''}
+    </div>
+
+    <h3 class="tasks-title">Today's tasks · ${fmtDate(d.date)}</h3>
+    <div class="tasks">
+      ${t.close_cash.yesterday_open && can('cash_close') ? `
+        <div class="task warn"><div class="task-head"><span class="task-icon">🗃</span><strong>Yesterday's cash is not closed</strong></div>
+          <div class="task-body"><button class="btn btn-warning btn-sm" onclick="navigate('reconcile')">Close cash now</button></div></div>` : ''}
+      ${task('🚪', 'Leaving today', t.leaving_today.count, t.leaving_today.items.map(r =>
+        row(`${h(r.full_name)} · ${h(r.bed || '')}`, h(r.mobile), can('checkout') ? `<button class="btn btn-danger btn-sm" onclick="showCheckoutModal('${r.id}','${esc(r.full_name)}')">Check out</button>` : '')).join(''), 'warn')}
+      ${t.collect_dues ? task('💰', 'Collect dues', t.collect_dues.count, t.collect_dues.items.map(r =>
+        row(`${h(r.full_name)} · ${rupees(r.dues_paise)}`, `${h(r.bed || (r.status === 'checked_out' ? 'left' : ''))} · ${r.days_overdue} days overdue`,
+          can('payments') ? `<button class="btn btn-primary btn-sm" onclick="showPaymentModal('${r.id}','${esc(r.full_name)}')">Collect</button>` : '')).join('')
+          + (t.collect_dues.count > t.collect_dues.items.length ? `<div class="td-small mt-12">+ ${t.collect_dues.count - t.collect_dues.items.length} more in Reports → Outstanding Dues</div>` : ''), 'bad') : ''}
+      ${task('⏰', 'Overstaying', t.overstaying.count, t.overstaying.items.map(r =>
+        row(`${h(r.full_name)} · ${h(r.bed || '')}`, `was due ${fmtDate(r.expected_checkout)}`,
+          can('checkout') ? `<button class="btn btn-outline btn-sm" onclick="showCheckoutModal('${r.id}','${esc(r.full_name)}')">Check out</button>` : '')).join(''), 'warn')}
+      ${task('📌', 'Arrivals on hold', t.arrivals.count, t.arrivals.items.map(a =>
+        row(`${h(a.prospect_name)} · ${h(a.bed || '')}`, `${h(a.prospect_phone)} · hold till ${fmtDate(a.lock_expires_at)}`,
+          can('checkin') ? `<button class="btn btn-primary btn-sm" onclick="navigate('checkin')">Check in</button>` : '')).join(''))}
+      ${task('🧹', 'Beds to clean', t.beds_to_clean.count, t.beds_to_clean.items.map(x =>
+        row(h(x.bed), 'mark ready when cleaned', `<button class="btn btn-outline btn-sm" onclick="markBedReady('${x.id}')">Ready</button>`)).join(''))}
+      ${can('approvals') ? task('✔️', 'Waiting for your approval', t.approvals.count, t.approvals.items.map(a =>
+        row(`${h(a.full_name)} · ${rupees(a.amount_paise)}`, a.type === 'deposit_refund' ? 'Refund at checkout' : h(a.type),
+          `<button class="btn btn-success btn-sm" onclick="approvePayment('${a.id}','approved')">Approve</button>`)).join(''), 'warn') : ''}
+    </div>`;
+}
+
+async function markBedReady(bedId) {
+  try { await api('PATCH', `/beds/${bedId}/status`, { status: 'available' }); toast('Bed is ready', 'success'); refreshCurrentPage(); }
+  catch (ex) { toast(ex.message, 'error'); }
+}
+
+// ── Beds — Floor Map ──────────────────────────────────────────
+async function renderBeds(el) {
+  const floors = await api('GET', '/floors');
+  const ha = document.getElementById('header-actions');
+  if (can('beds_setup')) {
+    ha.innerHTML = `<button class="btn btn-primary btn-sm" onclick="showAddFloorModal()">+ Floor with bunkers</button>`;
+  }
+  if (!floors.length) {
+    el.innerHTML = `<div class="empty-state"><div class="empty-icon">🛏</div>
+      <p>No beds yet.</p>
+      ${can('beds_setup') ? `<p class="mt-12">Add your first floor: choose how many bunkers it has and how many beds each bunker has.<br/>Beds are numbered automatically: <b>0A1, 0A2, 0B1…</b></p>
+      <button class="btn btn-primary mt-12" onclick="showAddFloorModal()">+ Add floor</button>` : ''}</div>`;
+    return;
+  }
+  let total = 0, occ = 0, avail = 0;
+  floors.forEach(f => f.rooms.forEach(rm => { total += rm.total_beds; occ += rm.occupied; avail += rm.beds.filter(b => b.status === 'available').length; }));
+  window._floorData = floors;
+  const idx = Math.min(window._floorIdx || 0, floors.length - 1);
+  el.innerHTML = `
+    <div class="kpis mb-20">
+      <div class="kpi"><span>Total beds</span><strong>${total}</strong></div>
+      <div class="kpi"><span>Occupied</span><strong>${occ}</strong></div>
+      <div class="kpi good"><span>Vacant</span><strong>${avail}</strong></div>
+    </div>
+    <div class="floor-tabs mb-12 btn-group">
+      ${floors.map((f, i) => `<button class="btn btn-sm ${i === idx ? 'btn-primary' : 'btn-outline'}" onclick="switchFloor(${i})">${h(f.label)} <span class="td-small">(${f.rooms.reduce((a, r) => a + r.total_beds, 0)})</span></button>`).join('')}
+    </div>
+    <div class="legend mb-12"><span class="dot available"></span>Vacant <span class="dot occupied"></span>Occupied <span class="dot cleaning"></span>Cleaning <span class="dot reserved"></span>On hold</div>
+    <div id="floor-content"></div>`;
+  switchFloor(idx);
+}
+
+function switchFloor(idx) {
+  window._floorIdx = idx;
+  document.querySelectorAll('.floor-tabs button').forEach((b, i) => { b.className = `btn btn-sm ${i === idx ? 'btn-primary' : 'btn-outline'}`; });
+  const floor = window._floorData[idx];
+  if (!floor) return;
+  const fc = document.getElementById('floor-content');
+  fc.innerHTML = `
+    ${can('beds_setup') ? `<div class="btn-group mb-12"><button class="btn btn-outline btn-sm" onclick="showAddBunkersModal('${floor.id}','${esc(floor.label)}')">+ Add bunkers to ${h(floor.label)}</button></div>` : ''}
+    ${floor.rooms.length ? `<div class="bunker-grid">${floor.rooms.map(rm => `
+      <div class="bunker">
+        <div class="bunker-name">Bunker ${h(rm.room_number)}</div>
+        <div class="bunker-beds">${rm.beds.map(b => `
+          <button class="bed-chip ${b.status}" onclick="showBedDetail('${b.id}')" title="${h(b.status)}">
+            <span class="bed-no">${h(b.bed_label)}</span>
+            <span class="bed-who">${b.resident_name ? h(b.resident_name) : (b.status === 'available' ? 'Vacant' : h(b.status))}</span>
+          </button>`).join('')}
+        </div>
+      </div>`).join('')}</div>`
+    : `<div class="empty-state"><p>No bunkers on this floor yet.</p></div>`}`;
+}
+
+function showAddFloorModal() {
+  const next = (window._floorData || []).reduce((m, f) => Math.max(m, f.floor_number + 1), 0);
+  openModal('Add Floor', `
+    <div class="field-row">
+      <div class="field"><label>Floor number *</label><input id="af-num" type="number" min="0" value="${next}" /><div class="field-note">0 = Ground floor. Used as the first digit of bed numbers.</div></div>
+      <div class="field"><label>Name *</label><input id="af-label" value="${next === 0 ? 'Ground Floor' : `Floor ${next}`}" /></div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>Number of bunkers *</label><input id="af-bunkers" type="number" min="1" max="100" value="6" /></div>
+      <div class="field"><label>Beds per bunker *</label><input id="af-per" type="number" min="1" max="6" value="2" /></div>
+    </div>
+    <div class="field"><label>Rate per bed per day (₹)</label><input id="af-rate" type="number" min="0" step="0.01" placeholder="e.g. 400" /></div>
+    <div class="preview-box" id="af-preview"></div>
+    <div id="af-error" class="error-msg hidden"></div>
+    <div class="btn-group mt-12">
+      <button class="btn btn-primary" id="af-submit" onclick="submitAddFloor()">Create floor and beds</button>
+      <button class="btn btn-outline" onclick="closeModal()">Cancel</button>
+    </div>`);
+  const upd = () => {
+    const n = document.getElementById('af-num').value || '0';
+    const k = Math.max(0, Math.min(100, parseInt(document.getElementById('af-bunkers').value) || 0));
+    const per = Math.max(0, Math.min(6, parseInt(document.getElementById('af-per').value) || 0));
+    const letters = Array.from({ length: Math.min(k, 3) }, (_, i) => String.fromCharCode(65 + i));
+    const sample = letters.map(L => Array.from({ length: per }, (_, j) => `${n}${L}${j + 1}`).join(', ')).join(' · ');
+    document.getElementById('af-preview').innerHTML = k && per ? `<b>${k * per} beds</b> will be created: ${h(sample)}${k > 3 ? ' …' : ''}` : '';
+  };
+  ['af-num', 'af-bunkers', 'af-per'].forEach(id => document.getElementById(id).addEventListener('input', upd));
+  upd();
+}
+
+async function submitAddFloor() {
+  const err = document.getElementById('af-error'); err.classList.add('hidden');
+  const btn = document.getElementById('af-submit'); btn.disabled = true;
+  try {
+    const f = await api('POST', '/floors', {
+      floor_number: parseInt(document.getElementById('af-num').value),
+      label: document.getElementById('af-label').value.trim(),
+    });
+    const r = await api('POST', `/floors/${f.id}/bunkers`, {
+      bunkers: parseInt(document.getElementById('af-bunkers').value),
+      beds_per_bunker: parseInt(document.getElementById('af-per').value),
+      daily_rate_paise: Math.round((parseFloat(document.getElementById('af-rate').value) || 0) * 100),
+    });
+    toast(`${f.label}: ${r.total_beds} beds created`, 'success'); closeModal(); window._floorIdx = 99; renderPage('beds');
+  } catch (ex) { err.textContent = ex.message; err.classList.remove('hidden'); btn.disabled = false; }
+}
+
+function showAddBunkersModal(floorId, floorLabel) {
+  openModal(`Add bunkers to ${floorLabel}`, `
+    <div class="field-row">
+      <div class="field"><label>Number of bunkers *</label><input id="ab-count" type="number" min="1" max="100" value="1" /></div>
+      <div class="field"><label>Beds per bunker *</label><input id="ab-per" type="number" min="1" max="6" value="2" /></div>
+    </div>
+    <div class="field"><label>Rate per bed per day (₹)</label><input id="ab-rate" type="number" min="0" step="0.01" placeholder="e.g. 400" /></div>
+    <p class="field-note">New bunkers continue the letters on this floor (e.g. after 0F comes 0G).</p>
+    <div id="ab-error" class="error-msg hidden"></div>
+    <div class="btn-group mt-12">
+      <button class="btn btn-primary" onclick="submitAddBunkers('${floorId}')">Add bunkers</button>
+      <button class="btn btn-outline" onclick="closeModal()">Cancel</button>
+    </div>`);
+}
+
+async function submitAddBunkers(floorId) {
+  const err = document.getElementById('ab-error'); err.classList.add('hidden');
+  try {
+    const r = await api('POST', `/floors/${floorId}/bunkers`, {
+      bunkers: parseInt(document.getElementById('ab-count').value),
+      beds_per_bunker: parseInt(document.getElementById('ab-per').value),
+      daily_rate_paise: Math.round((parseFloat(document.getElementById('ab-rate').value) || 0) * 100),
+    });
+    toast(`${r.total_beds} beds added (${r.created.map(c => c.bunker).join(', ')})`, 'success'); closeModal(); renderPage('beds');
+  } catch (ex) { err.textContent = ex.message; err.classList.remove('hidden'); }
+}
+
+async function showBedDetail(bedId) {
+  const b = await api('GET', `/beds/${bedId}`);
+  const isOwnerMgr = ['owner','manager'].includes(STATE.user.role);
+  openModal(`Bed: ${b.bed_label}`, `
+    <div class="field-row">
+      <div><div class="stat-label">Status</div><span class="badge badge-${b.status==='available'?'success':b.status==='occupied'?'info':'warning'}">${b.status}</span></div>
+      <div><div class="stat-label">Bunker</div><p>${h(b.room_number||'—')} · ${h(b.floor_label||'')}</p></div>
+    </div>
+    ${b.base_rate_paise ? `<div><div class="stat-label">Base Rate</div><p>${rupees(b.base_rate_paise)}/month</p></div>` : ''}
+    ${b.daily_rate_paise ? `<div><div class="stat-label">Daily Rate</div><p>${rupees(b.daily_rate_paise)}/day</p></div>` : ''}
+    ${b.resident_name ? `
+      <hr class="divider"/>
+      <div><strong>${h(b.resident_name)}</strong> · ${b.resident_mobile||''}</div>
+      <div class="text-muted">Check-in: ${fmtDate(b.check_in_date)} · Expected out: ${fmtDate(b.expected_checkout)}</div>
+      <div>Rate: ${rupees(b.rate_paise)} / ${b.rate_type === 'daily' ? 'day' : b.rate_type === 'weekly' ? 'week' : 'month'}</div>
+      <div class="btn-group mt-12">
+        <button class="btn btn-outline btn-sm" onclick="closeModal();showResidentDetail('${b.resident_id}')">View Details</button>
+        ${can('payments') ? `<button class="btn btn-outline btn-sm" onclick="closeModal();showPaymentModal('${b.resident_id}','${esc(b.resident_name)}')">Record Payment</button>` : ''}
+        ${can('checkout') ? `<button class="btn btn-danger btn-sm" onclick="closeModal();showCheckoutModal('${b.resident_id}','${esc(b.resident_name)}')">Check Out</button>` : ''}
+      </div>
+    ` : ''}
+    ${!b.resident_name && (b.status === 'available' || b.status === 'reserved') ? `
+      <hr class="divider"/>
+      <div class="btn-group">
+        ${can('checkin') ? `<button class="btn btn-primary btn-sm" onclick="closeModal();navigateCheckinForBed('${b.id}')">✅ Check In to this bed</button>` : ''}
+      </div>
+    ` : ''}
+    ${!b.resident_name && b.status !== 'occupied' ? `
+      <hr class="divider"/>
+      <div class="section-title">Change Status</div>
+      <div class="btn-group">
+        ${['available','cleaning'].filter(s=>s!==b.status).map(s =>
+          `<button class="btn btn-outline btn-sm" onclick="changeBedStatus('${bedId}','${s}')">Set ${s}</button>`
+        ).join('')}
+      </div>
+    ` : ''}
+    ${can('beds_setup') ? `
+      <hr class="divider"/>
+      <div class="section-title">Set Daily Rate</div>
+      <div class="field-row">
+        <div class="field"><label>Daily Rate (₹/day)</label><input id="br-rate" type="number" min="0" step="0.01" value="${((b.daily_rate_paise||0)/100).toFixed(2)}" /></div>
+        <div><button class="btn btn-outline btn-sm" style="margin-top:24px" onclick="saveBedRate('${bedId}')">Save Rate</button></div>
+      </div>
+    ` : ''}
+  `);
+}
+
+function navigateCheckinForBed(bedId) {
+  navigate('checkin');
+  setTimeout(() => {
+    const sel = document.getElementById('ci-bed');
+    if (sel) { sel.value = bedId; sel.dispatchEvent(new Event('change')); }
+  }, 300);
+}
+
+async function saveBedRate(bedId) {
+  try {
+    const rate = Math.round((parseFloat(document.getElementById('br-rate').value) || 0) * 100);
+    await api('PATCH', `/beds/${bedId}/rate`, { daily_rate_paise: rate });
+    toast(`Rate set to ${rupees(rate)}/day`, 'success');
+    closeModal(); renderPage('beds');
+  } catch(ex) { toast(ex.message, 'error'); }
+}
+
+async function changeBedStatus(bedId, status) {
+  try {
+    await api('PATCH', `/beds/${bedId}/status`, { status });
+    toast(`Bed set to ${status}`, 'success');
+    closeModal();
+    renderPage('beds');
+  } catch(ex) { toast(ex.message, 'error'); }
+}
+
+async function showAddBedModal() {
+  const floors = await api('GET', '/floors');
+  const roomOptions = floors.flatMap(f => f.rooms.map(r =>
+    `<option value="${r.id}">${h(f.label)} › Room ${h(r.room_number)}</option>`
+  )).join('');
+  openModal('Add Bed', `
+    <div class="field"><label>Room</label><select id="ab-room">${roomOptions}</select></div>
+    <div class="field-row">
+      <div class="field"><label>Bed Label *</label><input id="ab-label" placeholder="e.g. 101-D" /></div>
+      <div class="field"><label>Daily Rate (₹/day)</label><input id="ab-rate" type="number" min="0" step="0.01" value="0" placeholder="e.g. 500 for ₹500/day" /></div>
+    </div>
+    <div class="btn-group mt-12">
+      <button class="btn btn-primary" onclick="submitAddBed()">Add Bed</button>
+      <button class="btn btn-outline" onclick="closeModal()">Cancel</button>
+    </div>
+  `);
+}
+
+async function submitAddBed() {
+  try {
+    await api('POST', '/beds', {
+      room_id: document.getElementById('ab-room').value,
+      bed_label: document.getElementById('ab-label').value,
+      daily_rate_paise: Math.round((parseFloat(document.getElementById('ab-rate').value) || 0) * 100),
+    });
+    toast('Bed added', 'success'); closeModal(); renderPage('beds');
+  } catch(ex) { toast(ex.message, 'error'); }
+}
+
+// ── Check In ─────────────────────────────────────────────────
+const ID_TYPES = [
+  ['aadhaar', 'Aadhaar', '12-digit number'],
+  ['driving_licence', 'Driving Licence', 'e.g. MH1220110012345'],
+  ['passport', 'Passport', 'e.g. K1234567'],
+  ['voter_id', 'Voter ID', 'e.g. ABC1234567'],
+  ['pan', 'PAN Card', 'e.g. ABCDE1234F'],
+  ['other', 'Other', 'ID number'],
+];
+
+async function renderCheckin(el) {
+  const [avail, reserved] = await Promise.all([
+    api('GET', '/beds?status=available'),
+    api('GET', '/beds?status=reserved'),
+  ]);
+  const beds = [...avail, ...reserved];
+  if (!beds.length) {
+    el.innerHTML = `<div class="empty-state"><div class="empty-icon">🛏</div><p>No vacant beds right now.</p></div>`;
+    return;
+  }
+  window._bedRates = {};
+  beds.forEach(b => { window._bedRates[b.id] = b.daily_rate_paise || 0; });
+  const bedOpts = beds.map(b => `<option value="${b.id}">${h(b.bed_label)}${b.status === 'reserved' ? ' (on hold)' : ''}${b.daily_rate_paise ? ` — ${rupees(b.daily_rate_paise)}/day` : ''}</option>`).join('');
+  const today = todayIST();
+
+  el.innerHTML = `
+    <form id="checkin-form" class="card ci" onsubmit="return false">
+      <div id="ci-error" class="error-msg hidden"></div>
+
+      <div class="ci-step"><span class="ci-num">1</span><strong>Guest</strong></div>
+      <div class="field-row">
+        <div class="field"><label for="ci-name">Full name *</label><input id="ci-name" autocomplete="off" required /></div>
+        <div class="field"><label for="ci-mobile">Mobile *</label><input id="ci-mobile" type="tel" inputmode="numeric" maxlength="12" required /></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label for="ci-idtype">ID proof *</label>
+          <select id="ci-idtype">${ID_TYPES.map(([v, l]) => `<option value="${v}">${l}</option>`).join('')}</select></div>
+        <div class="field"><label for="ci-idnum">ID number *</label><input id="ci-idnum" autocomplete="off" placeholder="12-digit number" /></div>
+      </div>
+      <div class="field">
+        <label>Photo of ID <span class="field-note">(front and back — optional but recommended)</span></label>
+        <div class="upload-row">
+          <label class="upload-box" id="up-front-box"><input type="file" id="up-front" accept="image/*,application/pdf" capture="environment" hidden /><span>📷 Front</span></label>
+          <label class="upload-box" id="up-back-box"><input type="file" id="up-back" accept="image/*,application/pdf" capture="environment" hidden /><span>📷 Back</span></label>
+        </div>
+      </div>
+
+      <div class="ci-step"><span class="ci-num">2</span><strong>Stay</strong></div>
+      <div class="field-row">
+        <div class="field"><label for="ci-bed">Bed *</label><select id="ci-bed">${bedOpts}</select></div>
+        <div class="field"><label for="ci-rate-type">Charged</label>
+          <select id="ci-rate-type"><option value="daily">Per day</option><option value="weekly">Per week</option><option value="monthly">Per month</option></select></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label for="ci-checkin">Check-in *</label><input id="ci-checkin" type="date" value="${today}" /></div>
+        <div class="field"><label for="ci-checkout">Leaving on *</label><input id="ci-checkout" type="date" /></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label for="ci-rent">Rate (₹) *</label><input id="ci-rent" type="number" min="0" step="0.01" inputmode="decimal" /></div>
+        <div class="field"><label for="ci-deposit">Deposit (₹)</label><input id="ci-deposit" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0" /></div>
+      </div>
+
+      <div class="ci-step"><span class="ci-num">3</span><strong>Payment now</strong></div>
+      <div class="field-row">
+        <div class="field"><label for="ci-advance">Rent paid now (₹)</label><input id="ci-advance" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0" /></div>
+        <div class="field"><label for="ci-mode">Paid by</label>
+          <select id="ci-mode"><option value="cash">Cash</option><option value="upi">UPI</option><option value="card">Card</option><option value="bank_transfer">Bank transfer</option></select></div>
+      </div>
+      <div class="summary-box" id="ci-summary"></div>
+
+      <details class="more">
+        <summary>More details (address, emergency contact, notes)</summary>
+        <div class="field"><label for="ci-address">Permanent address</label><textarea id="ci-address" rows="2"></textarea></div>
+        <div class="field-row">
+          <div class="field"><label for="ci-ec-name">Emergency contact name</label><input id="ci-ec-name" /></div>
+          <div class="field"><label for="ci-ec-mobile">Emergency contact mobile</label><input id="ci-ec-mobile" type="tel" /></div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label for="ci-from">Coming from</label><input id="ci-from" /></div>
+          <div class="field"><label for="ci-purpose">Purpose of stay</label><input id="ci-purpose" placeholder="Work, study, travel…" /></div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label for="ci-due-day">Monthly rent due on day</label><input id="ci-due-day" type="number" min="1" max="28" /><div class="field-note">For monthly stays. Default: the check-in day.</div></div>
+          <div class="field"><label for="ci-notes">Notes</label><input id="ci-notes" /></div>
+        </div>
+      </details>
+
+      <label class="consent"><input type="checkbox" id="ci-consent" /> The guest agrees to their ID being stored (DPDP Act 2023)</label>
+
+      <div class="btn-group mt-12">
+        <button type="submit" id="ci-submit" class="btn btn-primary btn-lg" onclick="submitCheckin()">✅ Check in</button>
+        <button type="button" class="btn btn-outline" onclick="navigate('dashboard')">Cancel</button>
+      </div>
+    </form>`;
+
+  window._ciFiles = {};
+  const $ = (id) => document.getElementById(id);
+  const setOut = () => {
+    const t = $('ci-rate-type').value, start = $('ci-checkin').value || today;
+    const days = t === 'daily' ? 1 : t === 'weekly' ? 7 : 30;
+    $('ci-checkout').value = new Date(Date.parse(start) + days * 86400000).toISOString().slice(0, 10);
+  };
+  const fillRate = () => {
+    const daily = window._bedRates[$('ci-bed').value] || 0;
+    if (!daily) return;
+    const t = $('ci-rate-type').value;
+    $('ci-rent').value = ((daily * (t === 'daily' ? 1 : t === 'weekly' ? 7 : 30)) / 100).toFixed(2);
+  };
+  const summary = () => {
+    const rate = parseFloat($('ci-rent').value) || 0, dep = parseFloat($('ci-deposit').value) || 0, adv = parseFloat($('ci-advance').value) || 0;
+    const t = $('ci-rate-type').value;
+    const nights = Math.max(0, Math.round((Date.parse($('ci-checkout').value) - Date.parse($('ci-checkin').value)) / 86400000));
+    const stay = t === 'daily' ? rate * nights : null;
+    $('ci-summary').innerHTML = `
+      <div><span>Collect now</span><b>${rupees(Math.round((dep + adv) * 100))}</b></div>
+      <div class="td-small">Deposit ${rupees(Math.round(dep * 100))} + rent ${rupees(Math.round(adv * 100))}${stay !== null && nights ? ` · full stay of ${nights} night${nights > 1 ? 's' : ''} = ${rupees(Math.round(stay * 100))}` : ''}</div>`;
+  };
+  const idHint = () => { const t = ID_TYPES.find(x => x[0] === $('ci-idtype').value); $('ci-idnum').placeholder = t ? t[2] : ''; };
+  $('ci-bed').addEventListener('change', () => { fillRate(); summary(); });
+  $('ci-rate-type').addEventListener('change', () => { fillRate(); setOut(); summary(); });
+  $('ci-checkin').addEventListener('change', () => { setOut(); summary(); });
+  ['ci-checkout', 'ci-rent', 'ci-deposit', 'ci-advance'].forEach(id => $(id).addEventListener('input', summary));
+  $('ci-idtype').addEventListener('change', idHint);
+  ['front', 'back'].forEach(side => $(`up-${side}`).addEventListener('change', async (e) => {
+    const f = e.target.files[0];
+    if (!f) return;
+    try {
+      window._ciFiles[side] = await fileToUpload(f);
+      $(`up-${side}-box`).classList.add('done');
+      $(`up-${side}-box`).querySelector('span').textContent = `✓ ${side === 'front' ? 'Front' : 'Back'} added`;
+    } catch (ex) { toast(ex.message, 'error'); }
+  }));
+  fillRate(); setOut(); summary(); idHint();
+}
+
+/** Shrink a phone photo to ≤1600px JPEG (~200–400 KB) before upload; PDFs pass through. */
+async function fileToUpload(file) {
+  if (file.type === 'application/pdf') {
+    if (file.size > 1500 * 1024) throw new Error('PDF is too large (max 1.5 MB)');
+    return await new Promise((ok, bad) => { const r = new FileReader(); r.onload = () => ok(r.result); r.onerror = () => bad(new Error('Could not read the file')); r.readAsDataURL(file); });
+  }
+  if (!file.type.startsWith('image/')) throw new Error('Choose a photo or a PDF');
+  const url = URL.createObjectURL(file);
+  try {
+    const img = await new Promise((ok, bad) => { const i = new Image(); i.onload = () => ok(i); i.onerror = () => bad(new Error('Could not open the photo')); i.src = url; });
+    const scale = Math.min(1, 1600 / Math.max(img.width, img.height));
+    const c = document.createElement('canvas');
+    c.width = Math.round(img.width * scale); c.height = Math.round(img.height * scale);
+    c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+    return c.toDataURL('image/jpeg', 0.8);
+  } finally { URL.revokeObjectURL(url); }
+}
+
+async function uploadResidentDocs(residentId, files) {
+  let failed = 0;
+  for (const [side, dataUrl] of Object.entries(files)) {
+    try { await api('POST', `/residents/${residentId}/documents`, { doc_type: side === 'front' ? 'id_front' : 'id_back', data_url: dataUrl }); }
+    catch (_) { failed++; }
+  }
+  return failed;
+}
+
+
+
+async function submitCheckin() {
+  const err = document.getElementById('ci-error');
+  err.classList.add('hidden');
+  const $ = (id) => document.getElementById(id);
+  const fail = (msg, focusId) => {
+    err.textContent = msg; err.classList.remove('hidden'); err.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    if (focusId) $(focusId).focus();
+  };
+  if (!$('ci-name').value.trim()) return fail('Enter the guest\'s name', 'ci-name');
+  if ($('ci-mobile').value.replace(/\D/g, '').length < 10) return fail('Enter a 10-digit mobile number', 'ci-mobile');
+  if (!$('ci-idnum').value.trim()) return fail('Enter the ID number', 'ci-idnum');
+  if (!$('ci-checkout').value) return fail('Choose the leaving date', 'ci-checkout');
+  if (!(parseFloat($('ci-rent').value) > 0)) return fail('Enter the rate', 'ci-rent');
+  if (!$('ci-consent').checked) return fail('Tick the consent box to store the guest\'s ID', 'ci-consent');
+
+  const btn = $('ci-submit');
+  btn.disabled = true; btn.textContent = 'Checking in…';
+  try {
+    const checkIn = $('ci-checkin').value;
+    const data = {
+      full_name: $('ci-name').value.trim(), mobile: $('ci-mobile').value.trim(),
+      id_type: $('ci-idtype').value, id_number: $('ci-idnum').value.trim(), id_consent: true,
+      bed_id: $('ci-bed').value, check_in_date: checkIn, expected_checkout: $('ci-checkout').value,
+      rate_type: $('ci-rate-type').value,
+      rate_paise: Math.round((parseFloat($('ci-rent').value) || 0) * 100),
+      deposit_paise: Math.round((parseFloat($('ci-deposit').value) || 0) * 100),
+      amount_paid_paise: Math.round((parseFloat($('ci-advance').value) || 0) * 100),
+      payment_mode: $('ci-mode').value,
+      permanent_address: $('ci-address').value.trim(), emergency_contact_name: $('ci-ec-name').value.trim(),
+      emergency_contact_mobile: $('ci-ec-mobile').value.trim(), coming_from: $('ci-from').value.trim(),
+      purpose_of_visit: $('ci-purpose').value.trim(), notes: $('ci-notes').value.trim(),
+      rent_due_day: parseInt($('ci-due-day').value) || Math.min(28, parseInt(checkIn.slice(8)) || 1),
+    };
+    const res = await api('POST', '/residents', data);
+    const failed = await uploadResidentDocs(res.resident.id, window._ciFiles || {});
+    toast(failed ? `${data.full_name} checked in. ${failed} ID photo(s) did not upload — add them from the resident's page.`
+                 : `${data.full_name} checked in to ${$('ci-bed').selectedOptions[0].text.split(' ')[0]}`, failed ? 'warning' : 'success', 6000);
+    navigate('dashboard');
+  } catch (ex) {
+    fail(ex.message || 'Check-in failed');
+    btn.disabled = false; btn.textContent = '✅ Check in';
+  }
+}
+
+// ── Residents ─────────────────────────────────────────────────
+async function renderResidents(el) {
+  const ha = document.getElementById('header-actions');
+  ha.innerHTML = `
+    <input id="res-search" class="hdr-input" placeholder="Search name, mobile or bed…" />
+    <select id="res-status" class="hdr-input"><option value="active">Staying</option><option value="checked_out">Left</option><option value="all">All</option></select>`;
+
+  async function load() {
+    const search = document.getElementById('res-search')?.value.trim().toLowerCase() || '';
+    const status = document.getElementById('res-status')?.value || 'active';
+    const all = await api('GET', `/residents?status=${status}`);
+    const residents = search ? all.filter(r => [r.full_name, r.mobile, r.bed_label].some(v => String(v || '').toLowerCase().includes(search))) : all;
+    const today = todayIST();
+    el.innerHTML = residents.length ? `
+      <div class="card table-wrap">
+        <table class="res-table">
+          <thead><tr><th>Resident</th><th>Bed</th><th>Stay</th><th class="num">Dues</th><th></th></tr></thead>
+          <tbody>
+            ${residents.map(r => {
+              const out = r.actual_checkout || r.expected_checkout;
+              const late = r.status === 'active' && out && out < today;
+              return `<tr>
+                <td><a href="#" class="td-name" onclick="event.preventDefault();showResidentDetail('${r.id}')">${h(r.full_name)}</a><div class="td-small">${h(r.mobile)}</div></td>
+                <td><b>${h(r.bed_label || '—')}</b></td>
+                <td>${fmtDate(r.check_in_date)} → <span class="${late ? 'text-danger' : ''}">${fmtDate(out)}</span>${late ? '<div class="td-small text-danger">overstaying</div>' : ''}</td>
+                <td class="num">${r.pending_rent_paise > 0 ? `<span class="text-danger fw-bold">${rupees(r.pending_rent_paise)}</span>` : r.advance_credit_paise > 0 ? `<span class="text-success">${rupees(r.advance_credit_paise)} adv</span>` : '<span class="text-success">Paid</span>'}</td>
+                <td class="actions">
+                  ${r.status === 'active' && can('payments') ? `<button class="btn btn-outline btn-sm" onclick="showPaymentModal('${r.id}','${esc(r.full_name)}')">Pay</button>` : ''}
+                  ${r.status === 'active' && can('checkout') ? `<button class="btn btn-danger btn-sm" onclick="showCheckoutModal('${r.id}','${esc(r.full_name)}')">Check out</button>` : ''}
+                </td></tr>`;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>` : `<div class="empty-state"><div class="empty-icon">👥</div><p>No residents found</p></div>`;
+  }
+  await load();
+  document.getElementById('res-search').addEventListener('input', () => { clearTimeout(window._rsTimer); window._rsTimer = setTimeout(load, 250); });
+  document.getElementById('res-status').addEventListener('change', load);
+}
+
+async function showResidentDetail(id) {
+  const r = await api('GET', `/residents/${id}`);
+  const docs = r.documents || [];
+  const label = { id_front: 'ID front', id_back: 'ID back', photo: 'Photo', other: 'Document' };
+  openModal(`${r.full_name}`, `
+    <dl class="facts">
+      <div><dt>Mobile</dt><dd>${h(r.mobile)}</dd></div>
+      <div><dt>Bed</dt><dd>${h(r.bed_label || '—')}</dd></div>
+      <div><dt>Check-in</dt><dd>${fmtDate(r.check_in_date)}</dd></div>
+      <div><dt>${r.status === 'active' ? 'Leaving on' : 'Left on'}</dt><dd>${fmtDate(r.actual_checkout || r.expected_checkout)}</dd></div>
+      <div><dt>Rate</dt><dd>${rupees(r.rate_paise)} / ${r.rate_type === 'daily' ? 'day' : r.rate_type === 'weekly' ? 'week' : 'month'}</dd></div>
+      <div><dt>ID proof</dt><dd>${h(r.id_display || r.aadhaar_display || '—')}</dd></div>
+      ${r.balance ? `<div><dt>${r.balance.dues_paise >= 0 ? 'Dues' : 'Advance paid'}</dt><dd class="${r.balance.dues_paise > 0 ? 'text-danger' : 'text-success'} fw-bold">${rupees(Math.abs(r.balance.dues_paise))}</dd></div>
+      <div><dt>Deposit held</dt><dd>${rupees(r.balance.deposit_paise)}</dd></div>` : ''}
+    </dl>
+    <div class="section-title">ID documents</div>
+    <div class="doc-row">
+      ${docs.map(d => can('view_id_docs')
+        ? `<button class="btn btn-outline btn-sm" onclick="viewDocument('${r.id}','${d.id}')">📄 ${label[d.doc_type] || 'Document'}</button>`
+        : `<span class="badge badge-gray">📄 ${label[d.doc_type] || 'Document'}</span>`).join('') || '<span class="text-muted">No ID photo uploaded</span>'}
+      ${can('checkin') || can('view_id_docs') ? `<label class="btn btn-outline btn-sm">+ Add photo<input type="file" accept="image/*,application/pdf" capture="environment" hidden onchange="addResidentDoc('${r.id}', this)" /></label>` : ''}
+    </div>
+    <div class="btn-group mt-12">
+      ${r.status === 'active' && can('payments') ? `<button class="btn btn-primary btn-sm" onclick="closeModal();showPaymentModal('${r.id}','${esc(r.full_name)}')">Record payment</button>` : ''}
+      ${can('payments') || can('reports_finance') ? `<button class="btn btn-outline btn-sm" onclick="closeModal();showStatement('${r.id}')">Statement</button>` : ''}
+      ${r.status === 'active' && can('checkout') ? `<button class="btn btn-danger btn-sm" onclick="closeModal();showCheckoutModal('${r.id}','${esc(r.full_name)}')">Check out</button>` : ''}
+    </div>
+  `, { wide: true });
+}
+
+async function viewDocument(residentId, docId) {
+  try {
+    const res = await fetch(`/api/v1/residents/${residentId}/documents/${docId}`, { headers: { Authorization: `Bearer ${STATE.token}` } });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'Could not open the document');
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const isPdf = blob.type === 'application/pdf';
+    openModal('ID document', isPdf ? `<iframe src="${url}" style="width:100%;height:70vh;border:0"></iframe>` : `<img src="${url}" alt="ID document" style="width:100%;border-radius:8px" />`, { wide: true });
+  } catch (ex) { toast(ex.message, 'error'); }
+}
+
+async function addResidentDoc(residentId, input) {
+  const f = input.files[0];
+  if (!f) return;
+  try {
+    const dataUrl = await fileToUpload(f);
+    await api('POST', `/residents/${residentId}/documents`, { doc_type: 'id_front', data_url: dataUrl });
+    toast('ID photo saved', 'success');
+    showResidentDetail(residentId);
+  } catch (ex) { toast(ex.message, 'error'); }
+}
+
+async function showCheckoutModal(id, name) {
+  const today = todayIST();
+  openModal(`Check out: ${name}`, `
+    <div class="field-row">
+      <div class="field"><label for="co-date">Leaving date</label><input id="co-date" type="date" value="${today}" max="${today}" /></div>
+      <div class="field"><label for="co-extra">Damage / extra charges (₹)</label><input id="co-extra" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0" /></div>
+    </div>
+    <div class="field" id="co-note-wrap" hidden><label for="co-extra-note">What for?</label><input id="co-extra-note" placeholder="e.g. broken locker key" /></div>
+    <div id="co-bill" class="bill"><div class="loading-spinner" style="margin:12px auto"></div></div>
+    <div class="field"><label for="co-mode">Money paid / returned by</label>
+      <select id="co-mode"><option value="cash">Cash</option><option value="upi">UPI</option><option value="bank_transfer">Bank transfer</option><option value="card">Card</option></select></div>
+    <div id="co-error" class="error-msg hidden"></div>
+    <div class="btn-group mt-12">
+      <button class="btn btn-danger btn-lg" id="co-submit" disabled onclick="submitCheckout('${id}')">Confirm check-out</button>
+      <button class="btn btn-outline" onclick="closeModal()">Cancel</button>
+    </div>`);
+  const load = async () => {
+    const date = document.getElementById('co-date').value || today;
+    const extra = Math.round((parseFloat(document.getElementById('co-extra').value) || 0) * 100);
+    document.getElementById('co-note-wrap').hidden = !extra;
+    try {
+      const p = await api('GET', `/residents/${id}/checkout-preview?date=${date}&extra_paise=${extra}`);
+      window._coPreview = p;
+      const line = (l, v, cls = '') => `<div class="bill-line ${cls}"><span>${l}</span><span>${v}</span></div>`;
+      document.getElementById('co-bill').innerHTML =
+        line(`Rent for ${p.resident.nights} ${p.resident.rate_type === 'daily' ? 'night' : 'day'}${p.resident.nights > 1 ? 's' : ''} (${fmtDate(p.resident.check_in_date)} → ${fmtDate(date)})`, rupees(p.rent_total_paise))
+        + (p.other_charges_paise ? line('Other charges', rupees(p.other_charges_paise)) : '')
+        + (p.extra_charges_paise ? line('Damage / extra', rupees(p.extra_charges_paise)) : '')
+        + line('Already paid', '− ' + rupees(p.paid_paise))
+        + line('Deposit held', rupees(p.deposit_held_paise))
+        + (p.to_collect_paise > 0
+          ? line('<b>Collect from guest</b>', `<b>${rupees(p.to_collect_paise)}</b>`, 'bill-total bad')
+          : line('<b>Give back to guest</b>', `<b>${rupees(p.refund_paise)}</b>`, 'bill-total good'))
+        + (p.needs_approval ? '<div class="td-small mt-12">The refund will wait for the owner\'s approval. The bed is freed after approval.</div>' : '');
+      const btn = document.getElementById('co-submit');
+      btn.disabled = false;
+      btn.textContent = p.to_collect_paise > 0 ? `Collect ${rupees(p.to_collect_paise)} & check out`
+        : p.refund_paise > 0 ? `Refund ${rupees(p.refund_paise)} & check out` : 'Confirm check-out';
+    } catch (ex) {
+      document.getElementById('co-bill').innerHTML = `<div class="error-msg">${h(ex.message)}</div>`;
+      document.getElementById('co-submit').disabled = true;
+    }
+  };
+  document.getElementById('co-date').addEventListener('change', load);
+  document.getElementById('co-extra').addEventListener('input', () => { clearTimeout(window._coT); window._coT = setTimeout(load, 300); });
+  load();
+}
+
+async function submitCheckout(id) {
+  const err = document.getElementById('co-error');
+  err.classList.add('hidden');
+  const p = window._coPreview;
+  if (!p) return;
+  const btn = document.getElementById('co-submit');
+  btn.disabled = true;
+  try {
+    const res = await api('POST', `/residents/${id}/checkout`, {
+      checkout_date: document.getElementById('co-date').value,
+      extra_charges_paise: p.extra_charges_paise,
+      extra_charges_note: document.getElementById('co-extra-note').value.trim() || undefined,
+      deposit_refund_paise: p.refund_paise,
+      collect_paise: p.to_collect_paise,
+      payment_mode: document.getElementById('co-mode').value,
+    });
+    toast(res.refund_pending_approval ? 'Check-out sent for owner approval' : 'Checked out. Bed marked for cleaning.',
+      res.refund_pending_approval ? 'warning' : 'success', 5000);
+    closeModal(); refreshCurrentPage();
+  } catch (ex) { err.textContent = ex.message; err.classList.remove('hidden'); btn.disabled = false; }
+}
+
+// ── Payments ─────────────────────────────────────────────────
+async function renderPayments(el) {
+  const [residents, pending] = await Promise.all([
+    api('GET', '/residents?status=active'),
+    api('GET', '/payments/pending-approvals').catch(() => []),
+  ]);
+
+  const resOpts = residents.map(r =>
+    `<option value="${r.id}">${h(r.full_name)} — ${h(r.bed_label||'')}</option>`
+  ).join('');
+
+  el.innerHTML = `
+    ${pending.length ? `
+      <div class="card mb-20" style="border-left:3px solid var(--warning)">
+        <strong>⚠️ ${pending.length} Pending Approval(s)</strong>
+        <div class="table-wrap mt-12">
+          <table>
+            <thead><tr><th>Resident</th><th>Type</th><th>Amount</th><th>Recorded</th><th>Actions</th></tr></thead>
+            <tbody>
+              ${pending.map(p => `
+                <tr>
+                  <td>${h(p.resident_name)}</td><td>${p.type}</td>
+                  <td>${rupees(p.amount_paise)}</td><td>${fmtDate(p.created_at)}</td>
+                  <td>
+                    <button class="btn btn-success btn-sm" onclick="approvePayment('${p.id}','approved')">Approve</button>
+                    <button class="btn btn-danger btn-sm" onclick="approvePayment('${p.id}','rejected')">Reject</button>
+                  </td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    ` : ''}
+    <div class="card">
+      <strong>Record Payment</strong>
+      <div class="field mt-12"><label>Resident *</label><select id="pay-resident">${resOpts}</select></div>
+      <div class="field-row">
+        <div class="field"><label>Type</label>
+          <select id="pay-type">
+            <option value="rent">Rent</option><option value="deposit">Deposit</option>
+            <option value="advance">Advance</option><option value="extra_charge">Extra Charge</option>
+          </select>
+        </div>
+        <div class="field"><label>Amount (₹) *</label><input id="pay-amount" type="number" min="0.01" step="0.01" placeholder="e.g. 5000" /></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>Payment Mode</label>
+          <select id="pay-mode"><option value="cash">Cash</option><option value="upi">UPI</option><option value="card">Card</option><option value="bank_transfer">Bank Transfer</option></select>
+        </div>
+        <div class="field"><label>Billing Month</label><input id="pay-month" type="month" value="${todayIST().slice(0,7)}" /></div>
+      </div>
+      <div class="field"><label>Notes</label><input id="pay-notes" /></div>
+      <div id="pay-error" class="error-msg hidden"></div>
+      <button class="btn btn-primary mt-12" onclick="submitPayment()">💳 Record Payment</button>
+    </div>
+  `;
+}
+
+function showPaymentModal(residentId, residentName) {
+  openModal(`Record Payment: ${residentName}`, `
+    <input type="hidden" id="pm-resident" value="${residentId}" />
+    <div class="field-row">
+      <div class="field"><label>Type</label>
+        <select id="pm-type"><option value="rent">Rent</option><option value="advance">Advance</option><option value="deposit">Deposit</option><option value="extra_charge">Extra Charge</option></select>
+      </div>
+      <div class="field"><label>Amount (₹) *</label><input id="pm-amount" type="number" min="0.01" step="0.01" placeholder="e.g. 5000" /></div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>Payment Mode</label>
+        <select id="pm-mode"><option value="cash">Cash</option><option value="upi">UPI</option><option value="card">Card</option><option value="bank_transfer">Bank Transfer</option></select>
+      </div>
+      <div class="field"><label>Billing Month</label><input id="pm-month" type="month" value="${todayIST().slice(0,7)}" /></div>
+    </div>
+    <div class="field"><label>Notes</label><input id="pm-notes" /></div>
+    <div id="pm-error" class="error-msg hidden"></div>
+    <div class="btn-group mt-12">
+      <button class="btn btn-primary" onclick="submitModalPayment()">💳 Record Payment</button>
+      <button class="btn btn-outline" onclick="closeModal()">Cancel</button>
+    </div>
+  `);
+}
+
+// Records a payment; if the server says an identical one was saved <1 min ago,
+// ask before saving it again (protects against double-clicks and double entry).
+async function postPayment(body) {
+  try {
+    return await api('POST', '/payments', body);
+  } catch (ex) {
+    if (ex.data && ex.data.code === 'POSSIBLE_DUPLICATE' &&
+        confirm('The same payment was recorded less than a minute ago.\n\nRecord it AGAIN as a second payment?')) {
+      return api('POST', '/payments', { ...body, confirm_duplicate: true });
+    }
+    throw ex;
+  }
+}
+
+async function submitModalPayment() {
+  const err = document.getElementById('pm-error');
+  err.classList.add('hidden');
+  try {
+    await postPayment({
+      resident_id:   document.getElementById('pm-resident').value,
+      type:          document.getElementById('pm-type').value,
+      amount_paise:  Math.round((parseFloat(document.getElementById('pm-amount').value) || 0) * 100),
+      payment_mode:  document.getElementById('pm-mode').value,
+      billing_month: document.getElementById('pm-month').value,
+      notes:         document.getElementById('pm-notes').value,
+    });
+    toast('Payment recorded', 'success');
+    closeModal();
+    refreshCurrentPage();
+  } catch(ex) { err.textContent = ex.message; err.classList.remove('hidden'); }
+}
+
+async function submitPayment() {
+  const err = document.getElementById('pay-error');
+  err.classList.add('hidden');
+  try {
+    await postPayment({
+      resident_id:   document.getElementById('pay-resident').value,
+      type:          document.getElementById('pay-type').value,
+      amount_paise:  Math.round((parseFloat(document.getElementById('pay-amount').value) || 0) * 100),
+      payment_mode:  document.getElementById('pay-mode').value,
+      billing_month: document.getElementById('pay-month').value,
+      notes:         document.getElementById('pay-notes').value,
+    });
+    toast('Payment recorded and receipt generated', 'success');
+    renderPage('payments');
+  } catch(ex) { err.textContent = ex.message; err.classList.remove('hidden'); }
+}
+
+async function approvePayment(id, decision) {
+  try {
+    await api('POST', `/payments/${id}/approve`, { decision });
+    toast(`Payment ${decision}`, decision === 'approved' ? 'success' : 'warning');
+    refreshCurrentPage();
+  } catch(ex) { toast(ex.message, 'error'); }
+}
+
+// ── Add-ons ───────────────────────────────────────────────────
+async function renderAddons(el) {
+  const residents = await api('GET', '/residents?status=active');
+  const catalog   = await api('GET', '/addons/catalog').catch(() => []);
+  const resOpts   = residents.map(r => `<option value="${r.id}">${h(r.full_name)} — ${h(r.bed_label||'')}</option>`).join('');
+  const catOpts   = catalog.map(c => `<option value="${c.id}" data-price="${c.default_price_paise}">${h(c.name)} (${rupees(c.default_price_paise)})</option>`).join('');
+
+  el.innerHTML = `
+    <div class="card">
+      <strong>Add Charge</strong>
+      <div class="field mt-12"><label>Resident *</label><select id="ao-resident">${resOpts}</select></div>
+      <div class="field"><label>Catalog Item (optional)</label>
+        <select id="ao-catalog" onchange="(function(sel){var p=sel.options[sel.selectedIndex]?.dataset?.price;document.getElementById('ao-amount').value=p?(p/100).toFixed(2):'';})(this)">
+          <option value="">— Custom Entry —</option>${catOpts}
+        </select>
+      </div>
+      <div class="field"><label>Name / Description *</label><input id="ao-name" placeholder="Leave blank to use catalog item name" /></div>
+      <div class="field-row">
+        <div class="field"><label>Amount (₹) *</label><input id="ao-amount" type="number" min="0.01" step="0.01" /></div>
+        <div class="field"><label>Billing Mode</label>
+          <select id="ao-billing"><option value="immediate">Immediate</option><option value="monthly_bill">Next Bill</option></select>
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>Payment Mode</label>
+          <select id="ao-mode"><option value="cash">Cash</option><option value="upi">UPI</option><option value="card">Card</option></select>
+        </div>
+        <div class="field"><label>Reason</label><input id="ao-reason" /></div>
+      </div>
+      <div id="ao-error" class="error-msg hidden"></div>
+      <button class="btn btn-primary mt-12" onclick="submitAddon()">Add Charge</button>
+    </div>
+  `;
+}
+
+async function submitAddon() {
+  const err = document.getElementById('ao-error');
+  err.classList.add('hidden');
+  const residentId = document.getElementById('ao-resident').value;
+  try {
+    await api('POST', `/residents/${residentId}/addons`, {
+      catalog_item_id: document.getElementById('ao-catalog').value || undefined,
+      name:            document.getElementById('ao-name').value.trim() || undefined,
+      amount_paise:    Math.round((parseFloat(document.getElementById('ao-amount').value) || 0) * 100),
+      billing_mode:    document.getElementById('ao-billing').value,
+      payment_mode:    document.getElementById('ao-mode').value,
+      custom_reason:   document.getElementById('ao-reason').value.trim(),
+    });
+    toast('Add-on charge recorded', 'success'); renderPage('addons');
+  } catch(ex) { err.textContent = ex.message; err.classList.remove('hidden'); }
+}
+
+// ── Bookings ──────────────────────────────────────────────────
+async function renderBookings(el) {
+  const [bookings, beds] = await Promise.all([
+    api('GET', '/bookings'),
+    api('GET', '/beds?status=available'),
+  ]);
+  const bedOpts = beds.map(b => `<option value="${b.id}">${h(b.bed_label)} (${h(b.room_number||'')})</option>`).join('');
+
+  el.innerHTML = `
+    <div class="card mb-20">
+      <strong>New Booking (Bed Lock)</strong>
+      <div class="field-row mt-12">
+        <div class="field"><label>Bed *</label><select id="bk-bed">${bedOpts||'<option value="">No available beds</option>'}</select></div>
+        <div class="field"><label>Prospect Name *</label><input id="bk-name" /></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>Prospect Phone *</label><input id="bk-phone" type="tel" /></div>
+        <div class="field"><label>Advance Deposit (₹)</label><input id="bk-deposit" type="number" min="0" step="0.01" value="0" /></div>
+      </div>
+      <div id="bk-error" class="error-msg hidden"></div>
+      <button class="btn btn-primary mt-12" onclick="submitBooking()">🔒 Lock Bed</button>
+    </div>
+    <div class="card">
+      <strong>Active Bookings</strong>
+      ${bookings.length ? `
+        <div class="table-wrap mt-12">
+          <table>
+            <thead><tr><th>Prospect</th><th>Bed</th><th>Advance</th><th>Expires</th><th>Actions</th></tr></thead>
+            <tbody>
+              ${bookings.map(b => `
+                <tr>
+                  <td><div class="td-name">${h(b.prospect_name)}</div><div class="td-small">${h(b.prospect_phone)}</div></td>
+                  <td>${h(b.bed_label||'')} ${h(b.room_number||'')}</td>
+                  <td>${rupees(b.advance_deposit_paise)}</td>
+                  <td>${fmtDate(b.lock_expires_at)}</td>
+                  <td>
+                    <button class="btn btn-success btn-sm" onclick="confirmBooking('${b.id}')">Confirm</button>
+                    <button class="btn btn-danger btn-sm" onclick="cancelBooking('${b.id}')">Cancel</button>
+                  </td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
+      ` : '<p class="text-muted mt-12">No active bookings</p>'}
+    </div>
+  `;
+}
+
+async function submitBooking() {
+  const err = document.getElementById('bk-error');
+  err.classList.add('hidden');
+  try {
+    await api('POST', '/bookings', {
+      bed_id:                document.getElementById('bk-bed').value,
+      prospect_name:         document.getElementById('bk-name').value.trim(),
+      prospect_phone:        document.getElementById('bk-phone').value.trim(),
+      advance_deposit_paise: Math.round((parseFloat(document.getElementById('bk-deposit').value) || 0) * 100),
+    });
+    toast('Bed locked for 24 hours', 'success'); renderPage('bookings');
+  } catch(ex) { err.textContent = ex.message; err.classList.remove('hidden'); }
+}
+
+async function confirmBooking(id) {
+  try { await api('POST', `/bookings/${id}/confirm`); toast('Booking confirmed', 'success'); renderPage('bookings'); }
+  catch(ex) { toast(ex.message, 'error'); }
+}
+async function cancelBooking(id) {
+  try { await api('POST', `/bookings/${id}/cancel`); toast('Booking cancelled, bed released', 'warning'); renderPage('bookings'); }
+  catch(ex) { toast(ex.message, 'error'); }
+}
+
+// ── Cash Reconciliation ───────────────────────────────────────
+async function renderReconcile(el) {
+  const date = todayIST();
+  let pv = null;
+  try { pv = await api('GET', `/reconciliation/cash/preview?date=${date}`); } catch (_) { pv = null; }
+  const firstClose = pv && pv.opening_cash_paise == null;
+  el.innerHTML = `
+    <div class="card">
+      <strong>Close Cash Drawer</strong>
+      <p class="text-muted mt-12" style="font-size:13px">Count the cash in the drawer. The system expects:
+        opening cash + cash received − cash paid out (expenses, refunds)${pv && pv.from_date && pv.from_date !== date ? ` since ${fmtDate(pv.from_date)}` : ''}.</p>
+      ${pv ? `
+        <div class="stat-grid mt-12" id="rc-preview">
+          <div class="stat-card gray"><div class="stat-label">Opening</div><div class="stat-value" style="font-size:16px">${firstClose ? 'first close' : rupees(pv.opening_cash_paise)}</div></div>
+          <div class="stat-card success"><div class="stat-label">Cash In</div><div class="stat-value" style="font-size:16px">${rupees(pv.cash_in_paise)}</div></div>
+          <div class="stat-card danger"><div class="stat-label">Cash Out</div><div class="stat-value" style="font-size:16px">${rupees(pv.cash_out_paise)}</div></div>
+          <div class="stat-card accent"><div class="stat-label">Expected</div><div class="stat-value" style="font-size:16px">${firstClose ? '—' : rupees(pv.expected_cash_paise)}</div></div>
+        </div>
+        ${pv.is_closed ? `<div class="error-msg mt-12">Cash is already closed up to ${fmtDate(pv.closed_through)}.</div>` : ''}
+      ` : ''}
+      <div class="field-row mt-12">
+        <div class="field"><label>Date *</label><input id="rc-date" type="date" max="${date}" value="${date}" /></div>
+        <div class="field"><label>Drawer Amount (₹) *</label><input id="rc-amount" type="number" min="0" step="0.01" placeholder="Physical cash count in ₹" /></div>
+      </div>
+      ${firstClose ? `<div class="field"><label>Opening Cash (₹) — first close only</label><input id="rc-opening" type="number" min="0" step="0.01" value="0" /><div class="td-small">Cash that was already in the drawer before you started using DormBook.</div></div>` : ''}
+      <div id="rc-error" class="error-msg hidden"></div>
+      <button class="btn btn-primary mt-12" onclick="submitReconcile()">Submit Cash Close</button>
+    </div>
+  `;
+}
+
+async function submitReconcile() {
+  const err = document.getElementById('rc-error');
+  err.classList.add('hidden');
+  const amt = document.getElementById('rc-amount').value;
+  if (amt === '') { err.textContent = 'Enter the cash you counted'; err.classList.remove('hidden'); return; }
+  const openingEl = document.getElementById('rc-opening');
+  if (!confirm('Close the cash drawer? After closing, entries cannot be added to this day.')) return;
+  try {
+    const res = await api('POST', '/reconciliation/cash', {
+      date: document.getElementById('rc-date').value,
+      drawer_amount_paise: Math.round((parseFloat(amt) || 0) * 100),
+      ...(openingEl ? { opening_cash_paise: Math.round((parseFloat(openingEl.value) || 0) * 100) } : {}),
+    });
+    const msg = res.is_discrepancy
+      ? `⚠️ Cash ${res.delta_paise < 0 ? 'short' : 'over'} by ${rupees(Math.abs(res.delta_paise))} (expected ${rupees(res.system_amount_paise)}). Owner notified.`
+      : `Cash balanced ✅ (${rupees(res.drawer_amount_paise)})`;
+    toast(msg, res.is_discrepancy ? 'warning' : 'success', 7000);
+    renderPage('reconcile');
+  } catch(ex) { err.textContent = ex.message; err.classList.remove('hidden'); }
+}
+
+// ── Expenses ─────────────────────────────────────────────────
+async function renderExpenses(el) {
+  const expenses = await api('GET', `/expenses?from=${todayIST().slice(0,7)}-01`);
+  const total    = expenses.reduce((s, e) => s + e.amount_paise, 0);
+  el.innerHTML = `
+    <div class="card mb-20">
+      <strong>Add Expense</strong>
+      <div class="field-row mt-12">
+        <div class="field"><label>Category *</label>
+          <select id="ex-cat">
+            <option value="utilities">Utilities</option><option value="maintenance">Maintenance</option>
+            <option value="salary">Salary</option><option value="cleaning">Cleaning</option>
+            <option value="grocery">Grocery</option><option value="other">Other</option>
+          </select>
+        </div>
+        <div class="field"><label>Amount (₹) *</label><input id="ex-amount" type="number" min="0.01" step="0.01" /></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>Date *</label><input id="ex-date" type="date" value="${todayIST()}" /></div>
+        <div class="field"><label>Payment Mode</label>
+          <select id="ex-mode"><option value="cash">Cash</option><option value="upi">UPI</option><option value="card">Card</option></select>
+        </div>
+      </div>
+      <div class="field"><label>Description</label><input id="ex-desc" /></div>
+      <div id="ex-error" class="error-msg hidden"></div>
+      <button class="btn btn-primary mt-12" onclick="submitExpense()">Add Expense</button>
+    </div>
+    <div class="card">
+      <div class="flex-between mb-12">
+        <strong>This Month's Expenses</strong>
+        <span class="fw-bold text-danger">${rupees(total)} total</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Date</th><th>Category</th><th>Description</th><th>Amount</th><th>Mode</th>${can('expenses')?'<th>Actions</th>':''}</tr></thead>
+          <tbody>
+            ${expenses.map(e => `
+              <tr>
+                <td>${fmtDate(e.expense_date)}</td><td>${h(e.category)}</td>
+                <td>${h(e.description||'—')}</td><td class="text-danger">${rupees(e.amount_paise)}</td>
+                <td>${e.payment_mode}</td>
+                ${can('expenses')?`<td><button class="btn btn-danger btn-sm" onclick="deleteExpense('${e.id}')">Delete</button></td>`:''}
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+async function submitExpense() {
+  const err = document.getElementById('ex-error');
+  err.classList.add('hidden');
+  try {
+    await api('POST', '/expenses', {
+      category:     document.getElementById('ex-cat').value,
+      amount_paise: Math.round((parseFloat(document.getElementById('ex-amount').value) || 0) * 100),
+      expense_date: document.getElementById('ex-date').value,
+      payment_mode: document.getElementById('ex-mode').value,
+      description:  document.getElementById('ex-desc').value.trim(),
+    });
+    toast('Expense recorded', 'success'); renderPage('expenses');
+  } catch(ex) { err.textContent = ex.message; err.classList.remove('hidden'); }
+}
+
+async function deleteExpense(id) {
+  if (!confirm('Delete this expense? This cannot be undone.')) return;
+  try {
+    await api('DELETE', `/expenses/${id}`);
+    toast('Expense deleted', 'warning');
+    renderPage('expenses');
+  } catch(ex) { toast(ex.message, 'error'); }
+}
+
+// ── Reports ───────────────────────────────────────────────────
+async function renderReports(el) {
+  const list = await api('GET', '/reports/registers');
+  if (!list.length) { el.innerHTML = '<div class="empty-state"><p>You don\'t have access to any reports.</p></div>'; return; }
+  const st = STATE.rep || (STATE.rep = { id: list[0].id, from: todayIST().slice(0, 8) + '01', to: todayIST() });
+  if (!list.find(r => r.id === st.id)) st.id = list[0].id;
+  const cur = list.find(r => r.id === st.id);
+  el.innerHTML = `
+    <div class="report-bar no-print">
+      <div class="field"><label for="rp-type">Report</label>
+        <select id="rp-type">${list.map(r => `<option value="${r.id}" ${r.id === st.id ? 'selected' : ''}>${h(r.title)}</option>`).join('')}</select></div>
+      <div class="field" ${cur.as_of ? 'hidden' : ''}><label for="rp-from">From</label><input id="rp-from" type="date" value="${st.from}" max="${todayIST()}" /></div>
+      <div class="field"><label for="rp-to">${cur.as_of ? 'As on' : 'To'}</label><input id="rp-to" type="date" value="${st.to}" max="${todayIST()}" /></div>
+      <div class="btn-group">
+        <button class="btn btn-outline btn-sm" onclick="setReportRange('month')">This month</button>
+        <button class="btn btn-outline btn-sm" onclick="setReportRange('last')">Last month</button>
+      </div>
+    </div>
+    <div id="rp-doc"><div class="loading-spinner" style="margin:40px auto"></div></div>`;
+  const reload = () => { st.id = document.getElementById('rp-type').value; st.from = document.getElementById('rp-from').value; st.to = document.getElementById('rp-to').value; renderPage('reports'); };
+  ['rp-type', 'rp-from', 'rp-to'].forEach(id => document.getElementById(id).addEventListener('change', reload));
+  try {
+    const rep = await api('GET', `/reports/registers/${st.id}?from=${st.from}&to=${st.to}`);
+    window._report = rep;
+    document.getElementById('rp-doc').innerHTML = reportDocument(rep);
+  } catch (ex) { document.getElementById('rp-doc').innerHTML = `<div class="error-msg">${h(ex.message)}</div>`; }
+}
+
+function setReportRange(which) {
+  const t = todayIST();
+  if (which === 'month') { STATE.rep.from = t.slice(0, 8) + '01'; STATE.rep.to = t; }
+  else {
+    const d = new Date(Date.parse(t.slice(0, 8) + '01') - 86400000).toISOString().slice(0, 10);
+    STATE.rep.from = d.slice(0, 8) + '01'; STATE.rep.to = d;
+  }
+  renderPage('reports');
+}
+
+function fmtCell(v, type) {
+  if (v === null || v === undefined || v === '') return '';
+  if (type === 'money') return rupees(v);
+  if (type === 'date') return fmtDate(v);
+  if (type === 'pct') return `${v}%`;
+  if (type === 'number') return Number(v).toLocaleString('en-IN');
+  return h(v);
+}
+
+/** Letterhead + table: the same layout for every report, on screen and on paper. */
+function reportDocument(rep) {
+  const c = rep.company;
+  const period = rep.period.as_of ? `As on ${fmtDate(rep.period.as_of)}` : `${fmtDate(rep.period.from)} to ${fmtDate(rep.period.to)}`;
+  const cols = rep.columns;
+  const body = rep.rows.length ? rep.rows.map(r => `<tr class="${r.bold ? 'row-bold' : ''}">${cols.map(col =>
+    `<td class="${['money', 'number', 'pct'].includes(col.type) ? 'num' : ''}">${fmtCell(r[col.key], col.type)}</td>`).join('')}</tr>`).join('')
+    : `<tr><td colspan="${cols.length}" class="empty-row">No records for this period</td></tr>`;
+  const totals = rep.totals ? `<tfoot><tr>${cols.map((col, i) =>
+    `<td class="${['money', 'number', 'pct'].includes(col.type) ? 'num' : ''}">${i === 0 ? '<b>Total</b>' : rep.totals[col.key] !== undefined ? `<b>${fmtCell(rep.totals[col.key], col.type)}</b>` : ''}</td>`).join('')}</tr></tfoot>` : '';
+  return `
+    <div class="report-actions no-print btn-group mb-12">
+      <button class="btn btn-primary btn-sm" onclick="window.print()">🖨 Print / Save PDF</button>
+      <button class="btn btn-outline btn-sm" onclick="downloadReportCsv()">⬇ Excel (CSV)</button>
+    </div>
+    <article class="report-doc">
+      <header class="letterhead">
+        <div>
+          <div class="lh-name">${h(c.business_name)}</div>
+          ${c.property_name && c.property_name !== c.business_name ? `<div class="lh-sub">${h(c.property_name)}</div>` : ''}
+          <div class="lh-addr">${h(c.address || 'Add your address in Settings')}</div>
+          <div class="lh-addr">${[c.phone && `Ph: ${h(c.phone)}`, c.email && h(c.email), c.gstin && `GSTIN: ${h(c.gstin)}`].filter(Boolean).join(' · ')}</div>
+        </div>
+        <div class="lh-right">
+          <div class="lh-title">${h(rep.title)}</div>
+          <div>${period}</div>
+        </div>
+      </header>
+      ${rep.summary && rep.summary.length ? `<div class="rep-summary">${rep.summary.map(x => `<div><span>${h(x.label)}</span><b>${fmtCell(x.value, x.type)}</b></div>`).join('')}</div>` : ''}
+      <div class="table-wrap"><table class="report-table">
+        <thead><tr>${cols.map(col => `<th class="${['money', 'number', 'pct'].includes(col.type) ? 'num' : ''}">${h(col.label)}</th>`).join('')}</tr></thead>
+        <tbody>${body}</tbody>${totals}
+      </table></div>
+      ${rep.notes ? `<p class="rep-note">${h(rep.notes)}</p>` : ''}
+      <footer class="rep-foot">Generated on ${new Date(rep.generated_at).toLocaleString('en-IN')} by ${h(rep.generated_by || '')} · DormBook</footer>
+    </article>`;
+}
+
+function downloadReportCsv() {
+  const rep = window._report;
+  if (!rep) return;
+  const q = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  const plain = (v, t) => v === null || v === undefined ? '' : t === 'money' ? (v / 100).toFixed(2) : v;
+  const c = rep.company;
+  const lines = [
+    [c.business_name], [c.address], [rep.title, rep.period.as_of ? `As on ${rep.period.as_of}` : `${rep.period.from} to ${rep.period.to}`], [],
+    rep.columns.map(x => x.label + (x.type === 'money' ? ' (₹)' : '')),
+    ...rep.rows.map(r => rep.columns.map(x => plain(r[x.key], x.type))),
+  ];
+  if (rep.totals) lines.push(rep.columns.map((x, i) => i === 0 ? 'Total' : plain(rep.totals[x.key], x.type)));
+  const csv = '﻿' + lines.map(l => l.map(q).join(',')).join('\r\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+  a.download = `${rep.title.replace(/[^a-z0-9]+/gi, '-')}-${rep.period.as_of || rep.period.from + '-to-' + rep.period.to}.csv`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+
+
+// ── Daily Reports ─────────────────────────────────────────────
+const DAILY_TABS = [
+  { id: 'snapshot',  label: "Today",       roles: ['reception','manager','owner'] },
+  { id: 'dues',      label: 'Dues',        roles: ['manager','owner'] },
+  { id: 'cash',      label: 'Cash Book',   roles: ['reception','manager','owner'] },
+  { id: 'beds',      label: 'Bed Map',     roles: ['reception','manager','owner'] },
+  { id: 'movements', label: 'Check-ins / outs', roles: ['reception','manager','owner'] },
+];
+
+async function renderDaily(el) {
+  const role = STATE.user.role;
+  const tabs = DAILY_TABS.filter(t => t.roles.includes(role));
+  if (!tabs.find(t => t.id === STATE.dailyTab)) STATE.dailyTab = tabs[0].id;
+  const date = STATE.dailyDate || todayIST();
+  document.getElementById('header-actions').innerHTML =
+    `<input id="daily-date" type="date" max="${todayIST()}" value="${date}" style="padding:6px 10px;border:1px solid var(--gray-200);border-radius:var(--radius);font-size:13px" />`;
+  document.getElementById('daily-date').addEventListener('change', e => { STATE.dailyDate = e.target.value; renderPage('daily'); });
+  const tabBar = `<div class="btn-group mb-20">${tabs.map(t =>
+    `<button class="btn btn-sm ${t.id === STATE.dailyTab ? 'btn-primary' : 'btn-outline'}" onclick="STATE.dailyTab='${t.id}';renderPage('daily')">${h(t.label)}</button>`).join('')}</div>`;
+  const body = await ({ snapshot: dailySnapshot, dues: dailyDues, cash: dailyCash, beds: dailyBeds, movements: dailyMovements }[STATE.dailyTab])(date);
+  el.innerHTML = tabBar + body;
+}
+
+function dailyTable(head, rows, empty) {
+  if (!rows.length) return `<p class="text-muted mt-12">${empty}</p>`;
+  return `<div class="table-wrap mt-12"><table><thead><tr>${head.map(x => `<th>${x}</th>`).join('')}</tr></thead>
+    <tbody>${rows.join('')}</tbody></table></div>`;
+}
+
+async function dailySnapshot(date) {
+  const d = await api('GET', `/reports/daily/snapshot?date=${date}`);
+  const b = d.beds;
+  return `
+    <div class="stat-grid mb-20">
+      <div class="stat-card accent"><div class="stat-label">Occupancy</div><div class="stat-value">${b.occupancy_pct}%</div><div class="stat-sub">${b.occupied} of ${b.total} beds</div></div>
+      <div class="stat-card success"><div class="stat-label">Vacant</div><div class="stat-value">${b.available}</div><div class="stat-sub">${b.reserved} reserved · ${b.cleaning} cleaning</div></div>
+      <div class="stat-card"><div class="stat-label">Check-ins</div><div class="stat-value">${d.today.check_ins}</div></div>
+      <div class="stat-card"><div class="stat-label">Check-outs</div><div class="stat-value">${d.today.check_outs}</div><div class="stat-sub">${d.today.due_to_leave} due to leave</div></div>
+      ${d.collected ? `<div class="stat-card success"><div class="stat-label">Collected</div><div class="stat-value" style="font-size:18px">${rupees(d.collected.total_paise)}</div>
+        <div class="stat-sub">${d.collected.by_mode.map(m => `${h(m.mode)}: ${rupees(m.payments_paise + m.deposits_paise)}`).join(' · ') || '—'}</div></div>` : ''}
+      ${d.outstanding ? `<div class="stat-card ${d.outstanding.total_dues_paise > 0 ? 'danger' : 'gray'}"><div class="stat-label">Dues Outstanding</div><div class="stat-value" style="font-size:18px">${rupees(d.outstanding.total_dues_paise)}</div><div class="stat-sub">${d.outstanding.residents_with_dues} residents</div></div>
+      <div class="stat-card gray"><div class="stat-label">Deposits Held</div><div class="stat-value" style="font-size:18px">${rupees(d.outstanding.deposits_held_paise)}</div><div class="stat-sub">Advance credit ${rupees(d.outstanding.advance_credit_paise)}</div></div>` : ''}
+      <div class="stat-card ${d.cash_drawer.is_closed ? 'success' : 'warning'}"><div class="stat-label">Cash Drawer</div>
+        <div class="stat-value" style="font-size:16px">${d.cash_drawer.is_closed ? 'Closed ✅' : 'Open'}</div>
+        <div class="stat-sub">${d.cash_drawer.is_closed ? `through ${fmtDate(d.cash_drawer.closed_through)}` : `expected ${rupees(d.cash_drawer.expected_cash_paise)}`}</div></div>
+    </div>`;
+}
+
+async function dailyDues(date) {
+  const d = await api('GET', `/reports/daily/dues?date=${date}`);
+  const t = d.totals;
+  const riskBadge = r => r === 'LEFT_WITH_DUES' ? '<span class="badge badge-danger">left with dues</span>'
+    : r === 'DUES_EXCEED_DEPOSIT' ? '<span class="badge badge-warning">dues > deposit</span>' : '';
+  return `
+    <div class="stat-grid mb-20">
+      <div class="stat-card danger"><div class="stat-label">Total Dues</div><div class="stat-value" style="font-size:18px">${rupees(t.dues_paise)}</div><div class="stat-sub">${d.count} residents</div></div>
+      <div class="stat-card"><div class="stat-label">0–7 days</div><div class="stat-value" style="font-size:16px">${rupees(t.d0_7)}</div></div>
+      <div class="stat-card warning"><div class="stat-label">8–30 days</div><div class="stat-value" style="font-size:16px">${rupees(t.d8_30)}</div></div>
+      <div class="stat-card danger"><div class="stat-label">31–60 days</div><div class="stat-value" style="font-size:16px">${rupees(t.d31_60)}</div></div>
+      <div class="stat-card danger"><div class="stat-label">60+ days</div><div class="stat-value" style="font-size:16px">${rupees(t.d60_plus)}</div></div>
+    </div>
+    <div class="card">${dailyTable(['Resident','Bed','Dues','Overdue','Last paid','Deposit',''], d.rows.map(r => `
+      <tr><td><div class="td-name">${h(r.resident)}</div><div class="td-small">${h(r.mobile)} ${riskBadge(r.risk)}</div></td>
+        <td>${h(r.bed || '—')}</td><td class="text-danger fw-bold">${rupees(r.dues_paise)}</td>
+        <td>${r.days_overdue} days<div class="td-small">since ${fmtDate(r.oldest_unpaid_date)}</div></td>
+        <td>${fmtDate(r.last_payment_date)}</td><td>${rupees(r.deposit_held_paise)}</td>
+        <td><button class="btn btn-outline btn-sm" onclick="showStatement('${h(r.resident_id)}')">Statement</button>
+            <button class="btn btn-primary btn-sm" onclick="showPaymentModal('${h(r.resident_id)}','${esc(r.resident)}')">Collect</button></td></tr>`),
+      'No dues — everyone is paid up 🎉')}</div>`;
+}
+
+async function dailyCash(date) {
+  const d = await api('GET', `/reports/daily/cash-book?date=${date}`);
+  const label = { PAYMENT: 'Payment', DEPOSIT_IN: 'Deposit in', DEPOSIT_REFUND: 'Deposit refund', EXPENSE: 'Expense', BANK_DEPOSIT: 'To bank' };
+  const isIn = k => k === 'PAYMENT' || k === 'DEPOSIT_IN';
+  const modes = Object.entries(d.by_mode);
+  return `
+    <div class="stat-grid mb-20">
+      ${modes.map(([m, v]) => `<div class="stat-card"><div class="stat-label">${h(m)}</div><div class="stat-value" style="font-size:16px">${rupees(v.in_paise - v.out_paise)}</div><div class="stat-sub">in ${rupees(v.in_paise)} · out ${rupees(v.out_paise)}</div></div>`).join('')}
+      <div class="stat-card ${d.close ? (d.close.variance_paise ? 'warning' : 'success') : 'gray'}"><div class="stat-label">Drawer</div>
+        <div class="stat-value" style="font-size:16px">${d.close ? rupees(d.close.counted_cash_paise) : (d.drawer.is_closed ? 'closed' : 'open')}</div>
+        <div class="stat-sub">${d.close ? `expected ${rupees(d.close.expected_cash_paise)} · ${d.close.variance_paise ? `variance ${rupees(d.close.variance_paise)}` : 'balanced'}` : `expected so far ${rupees(d.drawer.expected_cash_paise)}`}</div></div>
+    </div>
+    <div class="card">${dailyTable(['Time','Type','Resident / Note','Mode','Amount','By'], d.entries.map(e => `
+      <tr style="${e.is_reversed || e.reversal_of ? 'opacity:.55' : ''}">
+        <td>${new Date(e.created_at).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })}</td>
+        <td>${label[e.kind] || e.kind}${e.reversal_of ? ' (reversal)' : ''}${e.is_reversed ? ' (reversed)' : ''}</td>
+        <td>${h(e.resident || e.category || '')}<div class="td-small">${h(e.reason || '')}</div></td>
+        <td>${h(e.mode || '')}</td>
+        <td class="${isIn(e.kind) === (e.amount_paise > 0) ? 'ledger-credit' : 'ledger-debit'}">${isIn(e.kind) ? '+' : '−'}${rupees(Math.abs(e.amount_paise))}</td>
+        <td>${h(e.recorded_by || '')}</td></tr>`), 'No money moved on this day.')}
+      ${d.by_staff.length ? `<div class="mt-12 td-small">Collected by: ${d.by_staff.map(x => `${h(x.staff)} (${h(x.mode)}) ${rupees(x.collected_paise)}`).join(' · ')}</div>` : ''}
+    </div>`;
+}
+
+async function dailyBeds() {
+  const d = await api('GET', '/reports/daily/bed-map');
+  const color = { occupied: 'accent', available: 'success', reserved: 'info', cleaning: 'warning', pending: 'gray' };
+  return d.floors.map(f => `
+    <div class="card mb-20"><strong>${h(f.floor)}</strong>
+      ${f.rooms.map(r => `<div class="mt-12"><div class="td-small">Room ${h(r.room)}</div><div class="stat-grid">
+        ${r.beds.map(b => `<div class="stat-card ${color[b.status] || 'gray'}">
+          <div class="stat-label">${h(b.bed)} · ${h(b.status)}${b.overstay ? ' · <span class="text-danger">overstay</span>' : ''}</div>
+          <div class="stat-value" style="font-size:14px">${b.resident ? h(b.resident) : '—'}</div>
+          <div class="stat-sub">${b.resident ? `since ${fmtDate(b.since)} · out ${fmtDate(b.leaving_on)}${b.dues_paise > 0 ? ` · <span class="text-danger">due ${rupees(b.dues_paise)}</span>` : ''}` : (b.vacant_since ? `vacant since ${fmtDate(b.vacant_since)}` : '')}</div>
+        </div>`).join('')}</div></div>`).join('')}
+    </div>`).join('') || '<div class="empty-state"><p>No beds set up yet</p></div>';
+}
+
+async function dailyMovements(date) {
+  const d = await api('GET', `/reports/daily/movements?date=${date}&days=7`);
+  const money = r => r.deposit_paise === undefined ? '' :
+    `<td>${rupees(r.dues_paise)}</td><td>${r.refund_due_paise >= 0 ? rupees(r.refund_due_paise) : `<span class="text-danger">collect ${rupees(-r.refund_due_paise)}</span>`}</td>`;
+  const moneyHead = d.check_ins.concat(d.check_outs, d.due_to_leave).some(r => r.deposit_paise !== undefined) ? ['Dues', 'Refund due'] : [];
+  const row = (r, dateField) => `<tr><td><div class="td-name">${h(r.resident)}</div><div class="td-small">${h(r.mobile)}</div></td>
+    <td>${h([r.room, r.bed].filter(Boolean).join(' / ') || '—')}</td><td>${fmtDate(r[dateField])}</td>${money(r)}</tr>`;
+  return `
+    <div class="card mb-20"><strong>Due to leave (next 7 days)</strong>${dailyTable(['Resident','Bed','Leaving', ...moneyHead], d.due_to_leave.map(r => row(r, 'expected_checkout')), 'Nobody is due to leave.')}</div>
+    <div class="card mb-20"><strong class="text-danger">Overstaying</strong>${dailyTable(['Resident','Bed','Was due', ...moneyHead], d.overstaying.map(r => row(r, 'expected_checkout')), 'No overstays.')}</div>
+    <div class="card mb-20"><strong>Check-ins</strong>${dailyTable(['Resident','Bed','Date', ...moneyHead], d.check_ins.map(r => row(r, 'check_in_date')), 'No check-ins.')}</div>
+    <div class="card mb-20"><strong>Check-outs</strong>${dailyTable(['Resident','Bed','Date', ...moneyHead], d.check_outs.map(r => row(r, 'actual_checkout')), 'No check-outs.')}</div>
+    <div class="card"><strong>Bookings (beds on hold)</strong>${dailyTable(['Prospect','Bed','Advance','Hold expires'], d.arriving_bookings.map(b =>
+      `<tr><td>${h(b.prospect_name)}<div class="td-small">${h(b.prospect_phone)}</div></td><td>${h(b.bed || '—')}</td><td>${rupees(b.advance_deposit_paise)}</td><td>${fmtDate(b.lock_expires_at)}</td></tr>`), 'No active bookings.')}</div>`;
+}
+
+async function showStatement(residentId) {
+  const d = await api('GET', `/residents/${residentId}/statement`);
+  const label = { CHARGE: 'Charge', PAYMENT: 'Payment', WAIVER: 'Discount', DEPOSIT_IN: 'Deposit received',
+    DEPOSIT_APPLY: 'Deposit adjusted', DEPOSIT_REFUND: 'Deposit refunded', OPENING_DUES: 'Opening dues', OPENING_DEPOSIT: 'Opening deposit' };
+  const canDiscount = ['manager','owner'].includes(STATE.user.role);
+  openModal(`Statement: ${d.resident.full_name}`, `
+    <div class="stat-grid mb-12">
+      <div class="stat-card ${d.balance.dues_paise > 0 ? 'danger' : 'success'}"><div class="stat-label">${d.balance.dues_paise >= 0 ? 'Owes' : 'Advance credit'}</div><div class="stat-value" style="font-size:18px">${rupees(Math.abs(d.balance.dues_paise))}</div></div>
+      <div class="stat-card gray"><div class="stat-label">Deposit held</div><div class="stat-value" style="font-size:18px">${rupees(d.balance.deposit_paise)}</div></div>
+    </div>
+    ${dailyTable(['Date','Entry','Amount','Balance'], d.entries.slice().reverse().map(e => `
+      <tr style="${e.reversal_of ? 'opacity:.6' : ''}"><td>${fmtDate(e.biz_date)}</td>
+        <td>${label[e.kind] || e.kind}${e.category && e.category !== 'rent' ? ` · ${h(e.category)}` : ''}${e.reversal_of ? ' (reversal)' : ''}
+          <div class="td-small">${h(e.reason || '')}${e.mode ? ` · ${h(e.mode)}` : ''}</div></td>
+        <td>${rupees(e.amount_paise)}</td><td>${rupees(e.dues_after_paise)}</td></tr>`), 'No entries yet.')}
+    ${canDiscount && d.balance.dues_paise > 0 ? `<div class="btn-group mt-12"><button class="btn btn-outline btn-sm" onclick="showDiscountModal('${h(residentId)}', ${d.balance.dues_paise})">Give Discount</button></div>` : ''}
+  `, { wide: true });
+}
+
+function showDiscountModal(residentId, duesPaise) {
+  openModal('Give Discount', `
+    <div class="field"><label>Amount (₹) — max ${rupees(duesPaise)}</label><input id="dc-amount" type="number" min="0.01" step="0.01" /></div>
+    <div class="field"><label>Reason *</label><input id="dc-reason" placeholder="e.g. AC not working for 5 days" /></div>
+    <div id="dc-error" class="error-msg hidden"></div>
+    <div class="btn-group mt-12"><button class="btn btn-primary" onclick="submitDiscount('${h(residentId)}')">Save Discount</button>
+      <button class="btn btn-outline" onclick="closeModal()">Cancel</button></div>`);
+}
+
+async function submitDiscount(residentId) {
+  const err = document.getElementById('dc-error');
+  err.classList.add('hidden');
+  try {
+    await api('POST', `/residents/${residentId}/discount`, {
+      amount_paise: Math.round((parseFloat(document.getElementById('dc-amount').value) || 0) * 100),
+      reason: document.getElementById('dc-reason').value.trim(),
+    });
+    toast('Discount saved', 'success');
+    closeModal(); showStatement(residentId);
+  } catch (ex) { err.textContent = ex.message; err.classList.remove('hidden'); }
+}
+
+// ── Property Settings (owner only) ────────────────────────────
+async function renderSettings(el) {
+  let settings;
+  try {
+    settings = await api('GET', '/properties/settings');
+  } catch(ex) {
+    el.innerHTML = `<div class="error-msg">Could not load settings: ${ex.message}</div>`;
+    return;
+  }
+  el.innerHTML = `
+    <div class="card">
+      <strong>Property Settings</strong>
+      <div class="field mt-12"><label>Property Name</label><input id="ps-name" value="${h(settings.name||'')}" /></div>
+      <div class="section-title">Shown on reports</div>
+      <div class="field"><label>Address</label><input id="ps-address" value="${h(settings.address||'')}" placeholder="Building, street, area" /></div>
+      <div class="field-row">
+        <div class="field"><label>City</label><input id="ps-city" value="${h(settings.city||'')}" /></div>
+        <div class="field"><label>State</label><input id="ps-state" value="${h(settings.state||'')}" /></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>PIN code</label><input id="ps-pin" value="${h(settings.pincode||'')}" inputmode="numeric" maxlength="6" /></div>
+        <div class="field"><label>Phone</label><input id="ps-phone" value="${h(settings.contact_phone||'')}" type="tel" /></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>Email</label><input id="ps-email" value="${h(settings.contact_email||'')}" type="email" /></div>
+        <div class="field"><label>GSTIN (optional)</label><input id="ps-gstin" value="${h(settings.gstin||'')}" maxlength="15" /></div>
+      </div>
+      <div class="section-title">Rules</div>
+      <div class="field"><label>WhatsApp Number (with country code)</label><input id="ps-wa" value="${settings.whatsapp_number||''}" placeholder="919999900001" /></div>
+      <div class="field-row">
+        <div class="field"><label>Cleaning Timeout (minutes)</label><input id="ps-clean" type="number" min="0" value="${settings.cleaning_timeout_minutes||120}" /></div>
+        <div class="field"><label>Refund Approval Threshold (₹)</label><input id="ps-refund" type="number" min="0" step="0.01" value="${((settings.refund_approval_threshold_paise||0)/100).toFixed(2)}" /></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>Booking Lock (hours)</label><input id="ps-lock" type="number" min="1" value="${settings.booking_lock_hours||24}" /></div>
+        <div class="field"><label>Cash Tolerance (₹)</label><input id="ps-cash" type="number" min="0" step="0.01" value="${((settings.cash_reconciliation_tolerance_paise||0)/100).toFixed(2)}" /></div>
+      </div>
+      <div id="ps-error" class="error-msg hidden"></div>
+      <button class="btn btn-primary mt-12" onclick="submitSettings()">Save Settings</button>
+    </div>
+  `;
+}
+
+async function submitSettings() {
+  const err = document.getElementById('ps-error');
+  err.classList.add('hidden');
+  try {
+    await api('PATCH', '/properties/settings', {
+      name:                              document.getElementById('ps-name').value.trim() || undefined,
+      address:       document.getElementById('ps-address').value.trim() || undefined,
+      city:          document.getElementById('ps-city').value.trim() || undefined,
+      state:         document.getElementById('ps-state').value.trim() || undefined,
+      pincode:       document.getElementById('ps-pin').value.trim() || undefined,
+      contact_phone: document.getElementById('ps-phone').value.trim(),
+      contact_email: document.getElementById('ps-email').value.trim(),
+      gstin:         document.getElementById('ps-gstin').value.trim(),
+      whatsapp_number:                   document.getElementById('ps-wa').value.trim() || undefined,
+      cleaning_timeout_minutes:          parseInt(document.getElementById('ps-clean').value),
+      refund_approval_threshold_paise:   Math.round((parseFloat(document.getElementById('ps-refund').value) || 0) * 100),
+      booking_lock_hours:                parseInt(document.getElementById('ps-lock').value),
+      cash_reconciliation_tolerance_paise: Math.round((parseFloat(document.getElementById('ps-cash').value) || 0) * 100),
+    });
+    toast('Settings saved', 'success');
+  } catch(ex) { err.textContent = ex.message; err.classList.remove('hidden'); }
+}
+
+// ── Staff ─────────────────────────────────────────────────────
+async function renderStaff(el) {
+  const data = await api('GET', '/staff');
+  window._perm = data;
+  document.getElementById('header-actions').innerHTML = `<button class="btn btn-primary btn-sm" onclick="showUserModal()">+ Add user</button>`;
+  const P = data.all_permissions;
+  el.innerHTML = `
+    <div class="card table-wrap">
+      <table>
+        <thead><tr><th>User</th><th>Role</th><th>Can do</th><th>Status</th><th></th></tr></thead>
+        <tbody>
+          ${data.staff.map(u => `
+            <tr>
+              <td><div class="td-name">${h(u.name)}</div><div class="td-small">${h(u.mobile)} ${h(u.email || '')}</div></td>
+              <td><span class="role-chip role-${u.role}">${u.role === 'reception' ? 'Reception' : u.role === 'manager' ? 'Manager' : 'Owner'}</span>
+                ${u.custom_permissions ? '<div class="td-small">custom access</div>' : ''}</td>
+              <td class="perm-list">${u.role === 'owner' ? '<span class="td-small">Everything</span>' : u.permissions.map(p => `<span class="perm">${h(P[p] || p)}</span>`).join('')}</td>
+              <td><span class="badge ${u.is_active ? 'badge-success' : 'badge-gray'}">${u.is_active ? 'Active' : 'Blocked'}</span></td>
+              <td class="actions">${u.role !== 'owner' && u.id !== STATE.user.id ? `
+                <button class="btn btn-outline btn-sm" onclick="showUserModal('${u.id}')">Edit</button>
+                <button class="btn btn-outline btn-sm" onclick="toggleStaff('${u.id}', ${u.is_active})">${u.is_active ? 'Block' : 'Unblock'}</button>` : ''}</td>
+            </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+    <p class="td-small mt-12">Blocked users cannot sign in. Their past entries stay in the records.</p>`;
+}
+
+async function toggleStaff(id, isActive) {
+  try {
+    if (isActive) { await api('DELETE', `/staff/${id}`); toast('User blocked', 'warning'); }
+    else { await api('PATCH', `/staff/${id}`, { is_active: true }); toast('User unblocked', 'success'); }
+    renderPage('staff');
+  } catch (ex) { toast(ex.message, 'error'); }
+}
+
+function showUserModal(userId) {
+  const data = window._perm;
+  const u = userId ? data.staff.find(x => x.id === userId) : null;
+  const P = data.all_permissions;
+  const role = u ? u.role : 'reception';
+  const checked = new Set(u ? u.permissions : data.role_defaults[role]);
+  const mine = STATE.user.permissions || Object.keys(P);
+  openModal(u ? `Edit ${u.name}` : 'Add user', `
+    ${u ? '' : `
+    <div class="field-row">
+      <div class="field"><label for="sf-name">Name *</label><input id="sf-name" /></div>
+      <div class="field"><label for="sf-mobile">Mobile * (used to sign in)</label><input id="sf-mobile" type="tel" /></div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label for="sf-email">Email</label><input id="sf-email" type="email" /></div>
+      <div class="field"><label for="sf-password">Password *</label><input id="sf-password" type="text" placeholder="Min 8 characters" /></div>
+    </div>`}
+    <div class="field"><label for="sf-role">Role</label>
+      <select id="sf-role"><option value="reception" ${role === 'reception' ? 'selected' : ''}>Reception</option><option value="manager" ${role === 'manager' ? 'selected' : ''}>Manager</option></select>
+      <div class="field-note">Choosing a role ticks its usual permissions. You can change any tick below.</div></div>
+    <div class="section-title">This user can</div>
+    <div class="perm-grid">
+      ${Object.entries(P).map(([k, label]) => `
+        <label class="perm-check ${mine.includes(k) ? '' : 'disabled'}"><input type="checkbox" value="${k}" ${checked.has(k) ? 'checked' : ''} ${mine.includes(k) ? '' : 'disabled'} /> ${h(label)}</label>`).join('')}
+    </div>
+    ${u ? `<div class="field mt-12"><label for="sf-newpass">Reset password</label><input id="sf-newpass" type="text" placeholder="Leave empty to keep the current password" /></div>` : ''}
+    <div id="sf-error" class="error-msg hidden"></div>
+    <div class="btn-group mt-12">
+      <button class="btn btn-primary" onclick="saveUser(${u ? `'${u.id}'` : 'null'})">${u ? 'Save' : 'Add user'}</button>
+      <button class="btn btn-outline" onclick="closeModal()">Cancel</button>
+    </div>`, { wide: true });
+  document.getElementById('sf-role').addEventListener('change', (e) => {
+    const def = new Set(data.role_defaults[e.target.value]);
+    document.querySelectorAll('.perm-grid input').forEach(cb => { if (!cb.disabled) cb.checked = def.has(cb.value); });
+  });
+}
+
+async function saveUser(userId) {
+  const err = document.getElementById('sf-error');
+  err.classList.add('hidden');
+  const permissions = [...document.querySelectorAll('.perm-grid input:checked')].map(cb => cb.value);
+  const role = document.getElementById('sf-role').value;
+  try {
+    if (userId) {
+      const body = { role, permissions };
+      const np = document.getElementById('sf-newpass').value;
+      if (np) body.new_password = np;
+      await api('PATCH', `/staff/${userId}`, body);
+      toast(np ? 'Saved. New password set.' : 'Saved', 'success');
+    } else {
+      await api('POST', '/staff', {
+        name: document.getElementById('sf-name').value.trim(), mobile: document.getElementById('sf-mobile').value.trim(),
+        email: document.getElementById('sf-email').value.trim() || undefined, password: document.getElementById('sf-password').value,
+        role, permissions,
+      });
+      toast('User added. They sign in with their mobile number and this password.', 'success', 6000);
+    }
+    closeModal(); renderPage('staff');
+  } catch (ex) { err.textContent = ex.message; err.classList.remove('hidden'); }
+}
+
+// ── Feedback ──────────────────────────────────────────────────
+async function renderFeedback(el) {
+  const data = await api('GET', '/feedback');
+  el.innerHTML = `
+    <div class="stat-grid mb-20">
+      <div class="stat-card success"><div class="stat-label">Good</div><div class="stat-value">${data.summary?.good||0}</div></div>
+      <div class="stat-card warning"><div class="stat-label">Average</div><div class="stat-value">${data.summary?.average||0}</div></div>
+      <div class="stat-card danger"><div class="stat-label">Needs Help</div><div class="stat-value">${data.summary?.needs_help||0}</div></div>
+    </div>
+    <div class="card table-wrap">
+      <table>
+        <thead><tr><th>Resident</th><th>Rating</th><th>Flagged</th><th>Date</th><th>Actions</th></tr></thead>
+        <tbody>
+          ${(data.feedback||[]).map(f => `
+            <tr>
+              <td><div class="td-name">${h(f.resident_name)}</div></td>
+              <td><span class="badge ${f.rating==='good'?'badge-success':f.rating==='average'?'badge-warning':'badge-danger'}">${f.rating}</span></td>
+              <td>${f.is_flagged?'⚠️ Flagged':'—'}</td>
+              <td>${fmtDate(f.created_at)}</td>
+              <td>${f.is_flagged&&!f.resolved_at?`<button class="btn btn-outline btn-sm" onclick="resolveFeedback('${f.id}')">Resolve</button>`:'—'}</td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+async function resolveFeedback(id) {
+  try { await api('PATCH', `/feedback/${id}/resolve`, { notes: 'Resolved via dashboard' }); toast('Feedback resolved', 'success'); renderPage('feedback'); }
+  catch(ex) { toast(ex.message, 'error'); }
+}
+
+// ── Add-on Catalog ────────────────────────────────────────────
+async function renderCatalog(el) {
+  const items = await api('GET', '/addons/catalog');
+  el.innerHTML = `
+    <div class="card mb-20">
+      <strong>Add Catalog Item</strong>
+      <div class="field-row mt-12">
+        <div class="field"><label>Name *</label><input id="cat-name" /></div>
+        <div class="field"><label>Category *</label><input id="cat-cat" placeholder="utilities, amenities, etc." /></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>Default Price (₹)</label><input id="cat-price" type="number" min="0" step="0.01" value="0" /></div>
+        <div class="field"><label>Assignable Item?</label>
+          <select id="cat-assign"><option value="0">No</option><option value="1">Yes (tracked item)</option></select>
+        </div>
+      </div>
+      <div id="cat-error" class="error-msg hidden"></div>
+      <button class="btn btn-primary mt-12" onclick="submitCatalogItem()">Add to Catalog</button>
+    </div>
+    <div class="card table-wrap">
+      <table>
+        <thead><tr><th>Name</th><th>Category</th><th>Price</th><th>Assignable</th><th>Status</th></tr></thead>
+        <tbody>
+          ${items.map(i => `
+            <tr>
+              <td class="td-name">${h(i.name)}</td><td>${h(i.category)}</td>
+              <td>${rupees(i.default_price_paise)}</td>
+              <td>${i.is_assignable?'Yes':'No'}</td>
+              <td><span class="badge ${i.is_active?'badge-success':'badge-gray'}">${i.is_active?'Active':'Inactive'}</span></td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+async function submitCatalogItem() {
+  const err = document.getElementById('cat-error');
+  err.classList.add('hidden');
+  try {
+    await api('POST', '/addons/catalog', {
+      name:                 document.getElementById('cat-name').value.trim(),
+      category:             document.getElementById('cat-cat').value.trim(),
+      default_price_paise:  Math.round((parseFloat(document.getElementById('cat-price').value) || 0) * 100),
+      is_assignable:        parseInt(document.getElementById('cat-assign').value),
+    });
+    toast('Catalog item added', 'success'); renderPage('catalog');
+  } catch(ex) { err.textContent = ex.message; err.classList.remove('hidden'); }
+}
+
+// ── Audit Log ─────────────────────────────────────────────────
+async function renderAudit(el) {
+  const rows = await api('GET', '/audit');
+  el.innerHTML = `
+    <div class="card table-wrap">
+      <table>
+        <thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Entity</th><th>Amount</th></tr></thead>
+        <tbody>
+          ${rows.map(r => `
+            <tr>
+              <td><div class="td-small">${new Date(r.created_at).toLocaleString('en-IN')}</div></td>
+              <td>${h(r.actor_name)}</td>
+              <td><code style="font-size:11px;background:var(--gray-100);padding:2px 6px;border-radius:4px">${h(r.action)}</code></td>
+              <td>${h(r.entity_type)}<div class="td-small">${r.entity_id.substring(0,8)}…</div></td>
+              <td>${r.amount_paise ? rupees(r.amount_paise) : '—'}</td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+// ── Admin Panel (superadmin only) ────────────────────────────
+async function renderAdminPanel(el) {
+  const [stats, accounts] = await Promise.all([
+    api('GET', '/admin/stats'),
+    api('GET', '/admin/accounts'),
+  ]);
+
+  el.innerHTML = `
+    <div class="stat-grid mb-20">
+      <div class="stat-card"><div class="stat-label">Total Accounts</div><div class="stat-value">${stats.total}</div></div>
+      <div class="stat-card warning"><div class="stat-label">On Trial</div><div class="stat-value">${stats.trial}</div></div>
+      <div class="stat-card success"><div class="stat-label">Active (Paid)</div><div class="stat-value">${stats.active}</div></div>
+      <div class="stat-card danger"><div class="stat-label">Suspended</div><div class="stat-value">${stats.suspended}</div></div>
+      <div class="stat-card"><div class="stat-label">Expired Trials</div><div class="stat-value">${stats.expired}</div></div>
+      <div class="stat-card accent"><div class="stat-label">Live Residents</div><div class="stat-value">${stats.residents}</div></div>
+    </div>
+    <div class="card table-wrap">
+      <strong>All Accounts</strong>
+      <div class="table-wrap mt-12">
+        <table>
+          <thead><tr>
+            <th>Business</th><th>Owner</th><th>Mobile</th><th>Plan</th>
+            <th>Trial Ends</th><th>Properties</th><th>Residents</th><th>Actions</th>
+          </tr></thead>
+          <tbody>
+            ${accounts.map(a => `
+              <tr>
+                <td><div class="td-name">${h(a.business_name)}</div></td>
+                <td>${h(a.owner_name || '—')}</td>
+                <td>${h(a.owner_mobile || '—')}</td>
+                <td>
+                  <span class="badge ${a.plan==='active'?'badge-success':a.plan==='trial'?'badge-warning':'badge-danger'}">
+                    ${a.plan}
+                  </span>
+                </td>
+                <td>${fmtDate(a.trial_ends_at)}</td>
+                <td>${a.properties}</td>
+                <td>${a.residents}</td>
+                <td>
+                  ${a.plan !== 'active' ? `<button class="btn btn-success btn-sm" onclick="adminActivate('${a.id}')">Activate</button>` : ''}
+                  ${a.plan !== 'suspended' ? `<button class="btn btn-danger btn-sm" onclick="adminSuspend('${a.id}')">Suspend</button>` : ''}
+                  <button class="btn btn-outline btn-sm" onclick="adminResetPassword('${a.id}','${esc(a.owner_name || '')}')">Reset password</button>
+                </td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+async function adminActivate(id) {
+  if (!confirm('Activate this account? Trial will be extended 30 days from today.')) return;
+  try {
+    await api('PATCH', `/admin/accounts/${id}/activate`);
+    toast('Account activated', 'success');
+    renderPage('admin');
+  } catch(ex) { toast(ex.message, 'error'); }
+}
+
+function adminResetPassword(id, name) {
+  openModal(`Reset password: ${name}`, `
+    <div class="field"><label for="arp-pass">New password for the owner</label><input id="arp-pass" type="text" placeholder="Min 8 characters" /></div>
+    <div id="arp-error" class="error-msg hidden"></div>
+    <div class="btn-group mt-12"><button class="btn btn-primary" onclick="submitAdminReset('${id}')">Set password</button>
+      <button class="btn btn-outline" onclick="closeModal()">Cancel</button></div>`);
+}
+
+async function submitAdminReset(id) {
+  const err = document.getElementById('arp-error'); err.classList.add('hidden');
+  try {
+    const r = await api('POST', `/admin/accounts/${id}/reset-password`, { new_password: document.getElementById('arp-pass').value });
+    toast(r.message + '. Tell the owner the new password.', 'success', 6000); closeModal();
+  } catch (ex) { err.textContent = ex.message; err.classList.remove('hidden'); }
+}
+
+async function adminSuspend(id) {
+  const reason = prompt('Reason for suspension (optional):') ?? '';
+  try {
+    await api('PATCH', `/admin/accounts/${id}/suspend`, { reason });
+    toast('Account suspended', 'warning');
+    renderPage('admin');
+  } catch(ex) { toast(ex.message, 'error'); }
+}
+
+// ── Boot ──────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', init);
