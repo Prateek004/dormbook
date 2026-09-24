@@ -95,6 +95,22 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('modal-overlay').addEventListener('click', e => { if (e.target === document.getElementById('modal-overlay')) closeModal(); });
 });
 
+// ── GST helpers (same maths as the server's ledger.gstSplit) ──
+const GST_RATES = [0, 5, 12, 18, 28, 40];
+function gstSplit(pricePaise, rateBp, inclusive) {
+  const p = Math.round(pricePaise || 0), r = Number(rateBp) || 0;
+  if (!r) return { gross: p, tax: 0, taxable: p };
+  const tax = inclusive ? Math.round((p * r) / (10000 + r)) : Math.round((p * r) / 10000);
+  const gross = inclusive ? p : p + tax;
+  return { gross, tax, taxable: gross - tax };
+}
+/** Business profile incl. GST settings; cached for the session, refreshed after Settings save. */
+async function getProfile(force) {
+  if (!STATE.profile || force) STATE.profile = await api('GET', '/properties/profile');
+  return STATE.profile;
+}
+const gstLabel = (bp, incl) => bp ? `${bp / 100}% GST ${incl ? 'incl.' : 'extra'}` : 'No GST';
+
 // ── Navigation ───────────────────────────────────────────────
 // Short menu. Pages with `tabs` group several screens behind one menu item.
 // Each page/tab shows only if the signed-in user has one of its permissions.
@@ -109,7 +125,9 @@ const PAGES = [
   ] },
   { id: 'bookings',  label: '📌 Bookings', perms: ['bookings'] },
   { id: 'g-reports', label: '📊 Reports', title: 'Reports', tabs: [
+    { id: 'summary', label: 'Monthly Summary', perms: ['reports_finance'] },
     { id: 'reports', label: 'Registers',  perms: ['reports_daily', 'reports_finance'] },
+    { id: 'gst',     label: 'GST',        perms: ['reports_finance'] },
     { id: 'daily',   label: 'Daily View', perms: ['reports_daily'] },
   ] },
   { id: 'g-settings', label: '⚙️ Settings', title: 'Settings', tabs: [
@@ -420,6 +438,8 @@ async function renderPage(page) {
       case 'reconcile': await renderReconcile(el); break;
       case 'expenses':  await renderExpenses(el);  break;
       case 'reports':   await renderReports(el);   break;
+      case 'gst':       await renderReports(el, 'gst'); break;
+      case 'summary':   await renderMonthly(el);   break;
       case 'daily':     await renderDaily(el);     break;
       case 'staff':     await renderStaff(el);     break;
       case 'feedback':  await renderFeedback(el);  break;
@@ -500,7 +520,7 @@ async function renderBeds(el) {
   const floors = await api('GET', '/floors');
   const ha = document.getElementById('header-actions');
   if (can('beds_setup')) {
-    ha.innerHTML = `<button class="btn btn-primary btn-sm" onclick="showAddFloorModal()">+ Floor with bunkers</button>`;
+    ha.innerHTML = `<button class="btn btn-primary btn-sm" onclick="showAddFloorModal()">+ Add floor</button>`;
   }
   if (!floors.length) {
     el.innerHTML = `<div class="empty-state"><div class="empty-icon">🛏</div>
@@ -532,23 +552,60 @@ function switchFloor(idx) {
   document.querySelectorAll('.floor-tabs button').forEach((b, i) => { b.className = `btn btn-sm ${i === idx ? 'btn-primary' : 'btn-outline'}`; });
   const floor = window._floorData[idx];
   if (!floor) return;
+  const edit = !!window._bedEdit && can('beds_setup');
+  const isFree = (b) => !b.resident_name && b.status !== 'occupied' && b.status !== 'reserved';
   const fc = document.getElementById('floor-content');
   fc.innerHTML = `
     ${can('beds_setup') ? `<div class="btn-group mb-12">
-      <button class="btn btn-outline btn-sm" onclick="showAddBunkersModal('${floor.id}','${esc(floor.label)}')">+ Add bunkers to ${h(floor.label)}</button>
-      ${floor.rooms.length ? `<button class="btn btn-outline btn-sm" onclick="showRenameModal(${idx})">✏️ Change bed names</button>` : ''}
-    </div>` : ''}
+      ${edit ? `
+        <button class="btn btn-primary btn-sm" onclick="setBedEdit(false)">✓ Done</button>
+        <button class="btn btn-outline btn-sm" onclick="showAddBunkersModal('${floor.id}','${esc(floor.label)}')">+ Add bunker</button>
+        ${floor.rooms.length ? `<button class="btn btn-outline btn-sm" onclick="showRenameModal(${idx})">✏️ Change names</button>` : ''}
+        <button class="btn btn-outline btn-sm text-danger" onclick="removeFloorAsk('${floor.id}','${esc(floor.label)}')">🗑 Remove ${h(floor.label)}</button>`
+      : `<button class="btn btn-outline btn-sm" onclick="setBedEdit(true)">✏️ Change beds (add / remove / rename)</button>`}
+    </div>
+    ${edit ? `<p class="td-small mb-12">Tap <b>+ Bed</b> to add a bed, <b>✕</b> to remove a bed, or <b>Remove bunker</b>. Beds with a guest or a booking can't be removed.</p>` : ''}` : ''}
     ${floor.rooms.length ? `<div class="bunker-grid">${floor.rooms.map(rm => `
-      <div class="bunker">
+      <div class="bunker ${edit ? 'editing' : ''}">
         <div class="bunker-name">Bunker ${h(rm.room_number)}</div>
         <div class="bunker-beds">${rm.beds.map(b => `
-          <button class="bed-chip ${b.status}" onclick="showBedDetail('${b.id}')" title="${h(b.status)}">
-            <span class="bed-no">${h(b.bed_label)}</span>
-            <span class="bed-who">${b.resident_name ? h(b.resident_name) : (b.status === 'available' ? 'Vacant' : h(b.status))}</span>
-          </button>`).join('')}
+          <div class="bed-wrap">
+            <button class="bed-chip ${b.status}" onclick="showBedDetail('${b.id}')" title="${h(b.status)}">
+              <span class="bed-no">${h(b.bed_label)}</span>
+              <span class="bed-who">${b.resident_name ? h(b.resident_name) : (b.status === 'available' ? 'Vacant' : h(b.status))}</span>
+            </button>
+            ${edit && isFree(b) ? `<button class="bed-x" title="Remove bed ${h(b.bed_label)}" aria-label="Remove bed ${h(b.bed_label)}" onclick="removeBedAsk('${b.id}','${esc(b.bed_label)}')">✕</button>` : ''}
+          </div>`).join('')}
         </div>
+        ${edit ? `<div class="bunker-tools">
+          <button class="btn btn-outline btn-sm" onclick="addBedToBunker('${rm.id}')">+ Bed</button>
+          <button class="btn btn-outline btn-sm text-danger" onclick="removeBunkerAsk('${rm.id}','${esc(rm.room_number)}')">Remove bunker</button>
+        </div>` : ''}
       </div>`).join('')}</div>`
-    : `<div class="empty-state"><p>No bunkers on this floor yet.</p></div>`}`;
+    : `<div class="empty-state"><p>No bunkers on this floor yet.</p>
+        ${can('beds_setup') ? `<button class="btn btn-primary mt-12" onclick="showAddBunkersModal('${floor.id}','${esc(floor.label)}')">+ Add bunkers</button>` : ''}</div>`}`;
+}
+
+function setBedEdit(on) { window._bedEdit = on; switchFloor(window._floorIdx || 0); }
+
+async function addBedToBunker(roomId) {
+  try { const b = await api('POST', `/rooms/${roomId}/beds`, {}); toast(`Bed ${b.bed_label} added`, 'success'); renderPage('beds'); }
+  catch (ex) { toast(ex.message, 'error'); }
+}
+async function removeBedAsk(bedId, label) {
+  if (!confirm(`Remove bed ${label}?`)) return;
+  try { await api('DELETE', `/beds/${bedId}`); toast(`Bed ${label} removed`, 'success'); renderPage('beds'); }
+  catch (ex) { toast(ex.message, 'error'); }
+}
+async function removeBunkerAsk(roomId, name) {
+  if (!confirm(`Remove bunker ${name} and all its beds?`)) return;
+  try { const r = await api('DELETE', `/rooms/${roomId}`); toast(`Bunker ${name} removed (${r.beds} beds)`, 'success'); renderPage('beds'); }
+  catch (ex) { toast(ex.message, 'error'); }
+}
+async function removeFloorAsk(floorId, label) {
+  if (!confirm(`Remove ${label} with all its bunkers and beds?`)) return;
+  try { const r = await api('DELETE', `/floors/${floorId}`); toast(`${label} removed (${r.beds} beds)`, 'success'); window._floorIdx = 0; renderPage('beds'); }
+  catch (ex) { toast(ex.message, 'error'); }
 }
 
 // Change names of the floor, its bunkers and beds (e.g. 0A1 → 101-A).
@@ -709,6 +766,7 @@ async function showBedDetail(bedId) {
     ` : ''}
     ${can('beds_setup') ? `
       <hr class="divider"/>
+      ${!b.resident_name && b.status !== 'occupied' && b.status !== 'reserved' ? `<div class="mb-12"><button class="btn btn-outline btn-sm text-danger" onclick="closeModal();removeBedAsk('${bedId}','${esc(b.bed_label)}')">🗑 Remove this bed</button></div>` : ''}
       <div class="section-title">Bed name</div>
       <div class="field-row">
         <div class="field"><label for="br-name">Name</label><input id="br-name" maxlength="20" value="${h(b.bed_label)}" /></div>
@@ -800,6 +858,8 @@ async function renderCheckin(el) {
   }
   window._bedRates = {};
   beds.forEach(b => { window._bedRates[b.id] = b.daily_rate_paise || 0; });
+  const prof = await getProfile(true).catch(() => ({}));
+  const rentGst = prof.gst_enabled ? { bp: prof.rent_gst_rate_bp || 0, incl: prof.rent_gst_inclusive !== false } : { bp: 0, incl: true };
   const bedOpts = beds.map(b => `<option value="${b.id}">${h(b.bed_label)}${b.status === 'reserved' ? ' (on hold)' : ''}${b.daily_rate_paise ? ` — ${rupees(b.daily_rate_paise)}/day` : ''}</option>`).join('');
   const today = todayIST();
 
@@ -891,9 +951,12 @@ async function renderCheckin(el) {
     const t = $('ci-rate-type').value;
     const nights = Math.max(0, Math.round((Date.parse($('ci-checkout').value) - Date.parse($('ci-checkin').value)) / 86400000));
     const stay = t === 'daily' ? rate * nights : null;
+    const withGst = (rupeesAmt) => gstSplit(Math.round(rupeesAmt * 100), rentGst.bp, rentGst.incl).gross;
+    const gstNote = rentGst.bp ? ` · rent ${rentGst.incl ? 'includes' : 'plus'} ${rentGst.bp / 100}% GST` +
+      (rentGst.incl ? '' : ` = ${rupees(withGst(rate))} per ${t === 'daily' ? 'day' : t === 'weekly' ? 'week' : 'month'}`) : '';
     $('ci-summary').innerHTML = `
       <div><span>Collect now</span><b>${rupees(Math.round((dep + adv) * 100))}</b></div>
-      <div class="td-small">Deposit ${rupees(Math.round(dep * 100))} + rent ${rupees(Math.round(adv * 100))}${stay !== null && nights ? ` · full stay of ${nights} night${nights > 1 ? 's' : ''} = ${rupees(Math.round(stay * 100))}` : ''}</div>`;
+      <div class="td-small">Deposit ${rupees(Math.round(dep * 100))} + rent ${rupees(Math.round(adv * 100))}${stay !== null && nights ? ` · full stay of ${nights} night${nights > 1 ? 's' : ''} = ${rupees(withGst(stay))}` : ''}${gstNote}</div>`;
   };
   const idHint = () => { const t = ID_TYPES.find(x => x[0] === $('ci-idtype').value); $('ci-idnum').placeholder = t ? t[2] : ''; };
   $('ci-bed').addEventListener('change', () => { fillRate(); summary(); });
@@ -1015,6 +1078,7 @@ async function renderResidents(el) {
                 <td class="actions">
                   ${r.status === 'active' && can('addons') ? `<button class="btn btn-outline btn-sm" title="Add tea, coffee, laundry… to the bill" onclick="showAddItemModal('${r.id}','${esc(r.full_name)}')">☕ Item</button>` : ''}
                   ${r.status === 'active' && can('payments') ? `<button class="btn btn-outline btn-sm" onclick="showPaymentModal('${r.id}','${esc(r.full_name)}')">Pay</button>` : ''}
+                  ${r.status !== 'active' && (can('payments') || can('reports_finance') || can('checkout')) ? `<button class="btn btn-outline btn-sm" onclick="showBill('${r.id}')">🧾 Bill</button>` : ''}
                   ${r.status === 'active' && can('checkout') ? `<button class="btn btn-danger btn-sm" onclick="showCheckoutModal('${r.id}','${esc(r.full_name)}')">Check out</button>` : ''}
                 </td></tr>`;
             }).join('')}
@@ -1052,6 +1116,7 @@ async function showResidentDetail(id) {
     <div class="btn-group mt-12">
       ${r.status === 'active' && can('payments') ? `<button class="btn btn-primary btn-sm" onclick="closeModal();showPaymentModal('${r.id}','${esc(r.full_name)}')">Record payment</button>` : ''}
       ${r.status === 'active' && can('addons') ? `<button class="btn btn-outline btn-sm" onclick="closeModal();showAddItemModal('${r.id}','${esc(r.full_name)}')">☕ Add item</button>` : ''}
+      ${can('payments') || can('reports_finance') || can('checkout') ? `<button class="btn btn-outline btn-sm" onclick="closeModal();showBill('${r.id}')">🧾 Bill</button>` : ''}
       ${can('payments') || can('reports_finance') ? `<button class="btn btn-outline btn-sm" onclick="closeModal();showStatement('${r.id}')">Statement</button>` : ''}
       ${r.status === 'active' && can('checkout') ? `<button class="btn btn-danger btn-sm" onclick="closeModal();showCheckoutModal('${r.id}','${esc(r.full_name)}')">Check out</button>` : ''}
     </div>
@@ -1296,16 +1361,20 @@ async function approvePayment(id, decision) {
 // the guest's dues (collected later or at checkout); "Paid now" records the
 // payment at the same time.
 async function showAddItemModal(residentId, residentName) {
-  let catalog = [], guests = [];
+  let catalog = [], guests = [], prof = {};
   try {
-    [catalog, guests] = await Promise.all([
+    [catalog, guests, prof] = await Promise.all([
       api('GET', '/addons/catalog'),
       residentId ? Promise.resolve([]) : api('GET', '/residents?status=active'),
+      getProfile(true).catch(() => ({})),
     ]);
   } catch (ex) { toast(ex.message, 'error'); return; }
+  const gstOn = !!prof.gst_enabled;
+  // Price the guest pays per unit (GST added when the item's price is "plus GST").
+  catalog.forEach(c => { c._bp = gstOn ? (c.gst_rate_bp || 0) : 0; c._incl = c.gst_inclusive !== 0; c._each = gstSplit(c.default_price_paise, c._bp, c._incl).gross; });
   if (!residentId && !guests.length) { toast('No guest is staying right now', 'warning'); return; }
 
-  window._cart = { lines: [], catalog };
+  window._cart = { lines: [], catalog, gstOn };
   openModal(residentName ? `Add item: ${residentName}` : 'Add item to bill', `
     ${residentId ? `<input type="hidden" id="ai-guest" value="${h(residentId)}" />` : `
       <div class="field"><label for="ai-guest">Guest *</label>
@@ -1314,7 +1383,7 @@ async function showAddItemModal(residentId, residentName) {
     ${catalog.length ? `
       <div class="section-title">Tap to add</div>
       <div class="item-grid">${catalog.map((c, i) =>
-        `<button type="button" class="item-btn" onclick="cartAdd(${i})"><span>${h(c.name)}</span><b>${rupees(c.default_price_paise)}</b></button>`).join('')}
+        `<button type="button" class="item-btn" onclick="cartAdd(${i})"><span>${h(c.name)}</span><b>${rupees(c._each)}</b>${c._bp ? `<em>${c._incl ? 'incl.' : '+'} ${c._bp / 100}% GST</em>` : ''}</button>`).join('')}
       </div>` : `
       <div class="preview-box">Your price list is empty. ${can('settings')
         ? `<a href="#" onclick="event.preventDefault();closeModal();navigate('catalog')">Add items like Tea, Coffee in Settings → Items &amp; Prices</a>, or type an item below.`
@@ -1348,7 +1417,7 @@ function cartAdd(i) {
   if (!c) return;
   const line = window._cart.lines.find(l => l.catalog_item_id === c.id);
   if (line) line.quantity = Math.min(99, line.quantity + 1);
-  else window._cart.lines.push({ catalog_item_id: c.id, name: c.name, unit: c.default_price_paise, quantity: 1 });
+  else window._cart.lines.push({ catalog_item_id: c.id, name: c.name, unit: c.default_price_paise, bp: c._bp, incl: c._incl, quantity: 1 });
   cartRender();
 }
 
@@ -1357,7 +1426,7 @@ function cartAddOther() {
   const unit = Math.round((parseFloat(document.getElementById('ai-other-price').value) || 0) * 100);
   if (!name) { toast('Type the item name', 'warning'); return; }
   if (unit <= 0) { toast('Type a price more than ₹0', 'warning'); return; }
-  window._cart.lines.push({ name, unit, quantity: 1 });
+  window._cart.lines.push({ name, unit, bp: 0, incl: true, quantity: 1 });
   document.getElementById('ai-other-name').value = '';
   document.getElementById('ai-other-price').value = '';
   cartRender();
@@ -1376,15 +1445,18 @@ function cartRender() {
   const box = document.getElementById('ai-cart');
   if (!box) return;
   const lines = window._cart.lines;
-  const total = lines.reduce((a, l) => a + l.unit * l.quantity, 0);
+  lines.forEach(l => { l._g = gstSplit(l.unit * l.quantity, l.bp, l.incl); });
+  const total = lines.reduce((a, l) => a + l._g.gross, 0);
+  const gst = lines.reduce((a, l) => a + l._g.tax, 0);
   box.innerHTML = lines.length ? `
     <table class="cart"><tbody>${lines.map((l, i) => `
-      <tr><td>${h(l.name)}<div class="td-small">${rupees(l.unit)} each</div></td>
+      <tr><td>${h(l.name)}<div class="td-small">${rupees(l.unit)} each${l.bp ? ` · ${l.incl ? 'incl.' : '+'} ${l.bp / 100}% GST` : ''}</div></td>
         <td class="qty"><button type="button" class="btn btn-outline btn-sm" onclick="cartQty(${i},-1)" aria-label="Less">−</button>
           <b>${l.quantity}</b>
           <button type="button" class="btn btn-outline btn-sm" onclick="cartQty(${i},1)" aria-label="More">+</button></td>
-        <td class="num">${rupees(l.unit * l.quantity)}</td></tr>`).join('')}
-    </tbody><tfoot><tr><td colspan="2"><b>Total</b></td><td class="num"><b>${rupees(total)}</b></td></tr></tfoot></table>`
+        <td class="num">${rupees(l._g.gross)}</td></tr>`).join('')}
+    </tbody><tfoot>${gst ? `<tr><td colspan="2" class="td-small">GST included in total</td><td class="num td-small">${rupees(gst)}</td></tr>` : ''}
+      <tr><td colspan="2"><b>Total</b></td><td class="num"><b>${rupees(total)}</b></td></tr></tfoot></table>`
     : '<div class="td-small text-muted">No items added yet.</div>';
   const paidNow = document.querySelector('input[name="ai-when"]:checked')?.value === 'immediate';
   document.getElementById('ai-mode-wrap').hidden = !paidNow;
@@ -1615,26 +1687,35 @@ async function deleteExpense(id) {
 }
 
 // ── Reports ───────────────────────────────────────────────────
-async function renderReports(el) {
-  const list = await api('GET', '/reports/registers');
-  if (!list.length) { el.innerHTML = '<div class="empty-state"><p>You don\'t have access to any reports.</p></div>'; return; }
-  const st = STATE.rep || (STATE.rep = { id: list[0].id, from: todayIST().slice(0, 8) + '01', to: todayIST() });
+// Registers (and the GST tab, which is the GST register on its own).
+async function renderReports(el, forced) {
+  const page = forced || 'reports';
+  const all = await api('GET', '/reports/registers');
+  const list = forced ? all.filter(r => r.id === forced) : all.filter(r => r.id !== 'gst');
+  if (!list.length) { el.innerHTML = '<div class="empty-state"><p>You don\'t have access to this report.</p></div>'; return; }
+  STATE.reps = STATE.reps || {};
+  const st = STATE.reps[page] || (STATE.reps[page] = { id: list[0].id, from: todayIST().slice(0, 8) + '01', to: todayIST() });
   if (!list.find(r => r.id === st.id)) st.id = list[0].id;
   const cur = list.find(r => r.id === st.id);
   el.innerHTML = `
     <div class="report-bar no-print">
-      <div class="field"><label for="rp-type">Report</label>
-        <select id="rp-type">${list.map(r => `<option value="${r.id}" ${r.id === st.id ? 'selected' : ''}>${h(r.title)}</option>`).join('')}</select></div>
+      ${forced ? '' : `<div class="field"><label for="rp-type">Report</label>
+        <select id="rp-type">${list.map(r => `<option value="${r.id}" ${r.id === st.id ? 'selected' : ''}>${h(r.title)}</option>`).join('')}</select></div>`}
       <div class="field" ${cur.as_of ? 'hidden' : ''}><label for="rp-from">From</label><input id="rp-from" type="date" value="${st.from}" max="${todayIST()}" /></div>
       <div class="field"><label for="rp-to">${cur.as_of ? 'As on' : 'To'}</label><input id="rp-to" type="date" value="${st.to}" max="${todayIST()}" /></div>
       <div class="btn-group">
-        <button class="btn btn-outline btn-sm" onclick="setReportRange('month')">This month</button>
-        <button class="btn btn-outline btn-sm" onclick="setReportRange('last')">Last month</button>
+        ${cur.as_of ? '' : `<button class="btn btn-outline btn-sm" onclick="setReportRange('${page}','today')">Today</button>`}
+        <button class="btn btn-outline btn-sm" onclick="setReportRange('${page}','month')">This month</button>
+        <button class="btn btn-outline btn-sm" onclick="setReportRange('${page}','last')">Last month</button>
       </div>
     </div>
     <div id="rp-doc"><div class="loading-spinner" style="margin:40px auto"></div></div>`;
-  const reload = () => { st.id = document.getElementById('rp-type').value; st.from = document.getElementById('rp-from').value; st.to = document.getElementById('rp-to').value; renderPage('reports'); };
-  ['rp-type', 'rp-from', 'rp-to'].forEach(id => document.getElementById(id).addEventListener('change', reload));
+  const reload = () => {
+    if (!forced) st.id = document.getElementById('rp-type').value;
+    st.from = document.getElementById('rp-from').value; st.to = document.getElementById('rp-to').value;
+    renderPage(page);
+  };
+  [forced ? null : 'rp-type', 'rp-from', 'rp-to'].filter(Boolean).forEach(id => document.getElementById(id).addEventListener('change', reload));
   try {
     const rep = await api('GET', `/reports/registers/${st.id}?from=${st.from}&to=${st.to}`);
     window._report = rep;
@@ -1642,14 +1723,164 @@ async function renderReports(el) {
   } catch (ex) { document.getElementById('rp-doc').innerHTML = `<div class="error-msg">${h(ex.message)}</div>`; }
 }
 
-function setReportRange(which) {
+function setReportRange(page, which) {
   const t = todayIST();
-  if (which === 'month') { STATE.rep.from = t.slice(0, 8) + '01'; STATE.rep.to = t; }
+  const st = STATE.reps[page];
+  if (which === 'today') { st.from = t; st.to = t; }
+  else if (which === 'month') { st.from = t.slice(0, 8) + '01'; st.to = t; }
   else {
     const d = new Date(Date.parse(t.slice(0, 8) + '01') - 86400000).toISOString().slice(0, 10);
-    STATE.rep.from = d.slice(0, 8) + '01'; STATE.rep.to = d;
+    st.from = d.slice(0, 8) + '01'; st.to = d;
   }
-  renderPage('reports');
+  renderPage(page);
+}
+
+/** The same letterhead block used by reports, the monthly summary and bills. */
+function letterhead(c, title, sub) {
+  return `
+      <header class="letterhead">
+        <div>
+          <div class="lh-name">${h(c.business_name)}</div>
+          ${c.property_name && c.property_name !== c.business_name ? `<div class="lh-sub">${h(c.property_name)}</div>` : ''}
+          <div class="lh-addr">${h(c.address || 'Add your address in Settings')}</div>
+          <div class="lh-addr">${[c.phone && `Ph: ${h(c.phone)}`, c.email && h(c.email), c.gstin && `GSTIN: ${h(c.gstin)}`].filter(Boolean).join(' · ')}</div>
+        </div>
+        <div class="lh-right">
+          <div class="lh-title">${h(title)}</div>
+          <div>${sub}</div>
+        </div>
+      </header>`;
+}
+
+// ── Monthly summary ───────────────────────────────────────────
+function monthName(m) { const [y, mm] = m.split('-').map(Number); return new Date(Date.UTC(y, mm - 1, 1)).toLocaleString('en-IN', { month: 'long', year: 'numeric', timeZone: 'UTC' }); }
+function shiftMonth(m, n) { const [y, mm] = m.split('-').map(Number); const t = y * 12 + (mm - 1) + n; return `${Math.floor(t / 12)}-${String((t % 12) + 1).padStart(2, '0')}`; }
+
+async function renderMonthly(el) {
+  const thisMonth = todayIST().slice(0, 7);
+  const month = STATE.sumMonth && STATE.sumMonth <= thisMonth ? STATE.sumMonth : thisMonth;
+  const d = await api('GET', `/reports/monthly?month=${month}`);
+  const k = d.kpis;
+  const tile = (label, value, sub, cls = '') => `<div class="kpi ${cls}"><span>${label}</span><strong>${value}</strong>${sub ? `<em>${sub}</em>` : ''}</div>`;
+  const table = (title, rows, extra) => `
+    <div class="card sum-card"><div class="sum-title">${title}</div>
+      ${rows.length ? `<table class="report-table compact"><tbody>${rows.map(r => `<tr><td>${h(r.head)}</td>${extra ? `<td class="num td-small">${r.gst ? `GST ${rupees(r.gst)}` : ''}</td>` : ''}<td class="num">${rupees(r.amount)}</td></tr>`).join('')}</tbody>
+      <tfoot><tr><td><b>Total</b></td>${extra ? '<td></td>' : ''}<td class="num"><b>${rupees(rows.reduce((a, r) => a + r.amount, 0))}</b></td></tr></tfoot></table>`
+      : '<p class="td-small text-muted">Nothing this month.</p>'}
+    </div>`;
+  el.innerHTML = `
+    <div class="report-bar no-print">
+      <div class="btn-group month-pick">
+        <button class="btn btn-outline btn-sm" onclick="STATE.sumMonth='${shiftMonth(month, -1)}';renderPage('summary')" aria-label="Previous month">‹</button>
+        <strong class="month-label">${monthName(month)}</strong>
+        <button class="btn btn-outline btn-sm" ${month >= thisMonth ? 'disabled' : ''} onclick="STATE.sumMonth='${shiftMonth(month, 1)}';renderPage('summary')" aria-label="Next month">›</button>
+      </div>
+      <button class="btn btn-primary btn-sm" onclick="window.print()">🖨 Print / Save PDF</button>
+    </div>
+    <article class="report-doc">
+      ${letterhead(d.company, 'Monthly Summary', monthName(month))}
+      <div class="kpis kpis-4 mb-20">
+        ${tile('Money received', rupees(k.received), 'cash, UPI, card, bank')}
+        ${tile('Expenses', rupees(k.expenses), '')}
+        ${tile(k.profit >= 0 ? 'Profit' : 'Loss', rupees(Math.abs(k.profit)), 'received − expenses', k.profit >= 0 ? 'good' : 'bad')}
+        ${tile('Occupancy', `${k.occupancy_pct}%`, `month average · ${k.beds} beds · ${k.check_ins} in, ${k.check_outs} out`)}
+        ${tile('Billed', rupees(k.billed), k.gst_billed ? `incl. GST ${rupees(k.gst_billed)}` : 'rent + items')}
+        ${tile('Dues pending', rupees(k.dues_outstanding), 'at month end', k.dues_outstanding ? 'bad' : '')}
+        ${tile('Deposits', rupees(k.deposits_received), `refunded ${rupees(k.deposits_refunded)}`)}
+        ${tile('Discounts', rupees(k.discount), '')}
+      </div>
+      <div class="card sum-card mb-20">
+        <div class="sum-title">Last 6 months</div>
+        ${trendChart(d.trend)}
+      </div>
+      <div class="sum-grid">
+        ${table('Money received', d.income)}
+        ${table('Expenses', d.expenses)}
+        ${table('Billed to guests', d.billed, true)}
+      </div>
+      <p class="rep-note">${h(d.notes)}</p>
+    </article>`;
+}
+
+/** Grouped bars: money received vs expenses per month. One y-axis, legend, hover titles, table fallback. */
+function trendChart(trend) {
+  const W = 640, H = 220, pad = { l: 56, r: 12, t: 12, b: 28 };
+  const max = Math.max(1, ...trend.map(t => Math.max(t.income, t.expenses)));
+  const step = (() => { const raw = max / 4; const p = Math.pow(10, Math.floor(Math.log10(raw))); return Math.ceil(raw / p) * p; })();
+  const top = step * 4;
+  const x0 = pad.l, iw = W - pad.l - pad.r, ih = H - pad.t - pad.b;
+  const gw = iw / trend.length, bw = Math.min(28, (gw - 14) / 2);
+  const y = (v) => pad.t + ih - (v / top) * ih;
+  const short = (p) => { const r = p / 100; return r >= 100000 ? `₹${(r / 100000).toFixed(r >= 1000000 ? 0 : 1)}L` : r >= 1000 ? `₹${Math.round(r / 1000)}k` : `₹${Math.round(r)}`; };
+  const bar = (x, v, cls, label) => { const hgt = Math.max(0, pad.t + ih - y(v)); const r = Math.min(4, bw / 2, hgt);
+    return `<path class="${cls}" d="M${x},${pad.t + ih} v${-(hgt - r)} q0,${-r} ${r},${-r} h${bw - 2 * r} q${r},0 ${r},${r} v${hgt - r} z"><title>${label}</title></path>`; };
+  const grid = [0, 1, 2, 3, 4].map(i => `<line class="grid" x1="${x0}" x2="${W - pad.r}" y1="${y(step * i)}" y2="${y(step * i)}"/><text class="tick" x="${x0 - 8}" y="${y(step * i) + 4}" text-anchor="end">${short(step * i)}</text>`).join('');
+  const bars = trend.map((t, i) => {
+    const gx = x0 + i * gw + (gw - (2 * bw + 2)) / 2;
+    const name = monthName(t.month);
+    return `<g class="bar-grp">${bar(gx, t.income, 'b-in', `${name} — received ${rupees(t.income)}`)}${bar(gx + bw + 2, t.expenses, 'b-ex', `${name} — expenses ${rupees(t.expenses)}`)}
+      <rect class="hit" x="${x0 + i * gw}" y="${pad.t}" width="${gw}" height="${ih}"><title>${name}\nReceived ${rupees(t.income)}\nExpenses ${rupees(t.expenses)}\n${t.profit >= 0 ? 'Profit' : 'Loss'} ${rupees(Math.abs(t.profit))}</title></rect>
+      <text class="tick" x="${x0 + i * gw + gw / 2}" y="${H - 8}" text-anchor="middle">${name.split(' ')[0].slice(0, 3)}</text></g>`;
+  }).join('');
+  return `
+    <div class="chart-legend"><span><i class="sw b-in"></i>Money received</span><span><i class="sw b-ex"></i>Expenses</span></div>
+    <svg class="trend" viewBox="0 0 ${W} ${H}" role="img" aria-label="Money received and expenses, last 6 months">${grid}${bars}</svg>
+    <details class="no-print mt-4"><summary class="td-small">Show as table</summary>
+      <table class="report-table compact"><thead><tr><th>Month</th><th class="num">Received</th><th class="num">Expenses</th><th class="num">Profit</th></tr></thead>
+      <tbody>${trend.map(t => `<tr><td>${monthName(t.month)}</td><td class="num">${rupees(t.income)}</td><td class="num">${rupees(t.expenses)}</td><td class="num">${rupees(t.profit)}</td></tr>`).join('')}</tbody></table>
+    </details>`;
+}
+
+// ── Guest bill / tax invoice ─────────────────────────────────
+async function showBill(residentId) {
+  let b;
+  try { b = await api('GET', `/residents/${residentId}/bill`); } catch (ex) { toast(ex.message, 'error'); return; }
+  const hasGst = b.totals.gst > 0;
+  const lines = b.lines.length ? b.lines.map((l, i) => `<tr><td>${i + 1}</td><td>${h(l.description)}</td>
+      ${hasGst ? `<td class="num">${l.rate ? l.rate + '%' : '—'}</td><td class="num">${rupees(l.taxable)}</td><td class="num">${rupees(l.gst)}</td>` : ''}
+      <td class="num">${rupees(l.amount)}</td></tr>`).join('')
+    : `<tr><td colspan="${hasGst ? 6 : 3}" class="empty-row">Nothing billed yet</td></tr>`;
+  const g = b.guest;
+  const owes = b.balance > 0, adv = b.balance < 0;
+  openModal(`${b.title} · ${b.bill_no}`, `
+    <div class="btn-group no-print mb-12">
+      <button class="btn btn-primary btn-sm" onclick="printBill()">🖨 Print / Save PDF</button>
+    </div>
+    <article class="report-doc bill-doc" id="bill-doc">
+      ${letterhead(b.company, b.title, `No. ${h(b.bill_no)} · ${fmtDate(b.date)}`)}
+      <div class="bill-to">
+        <div><div class="td-small">Bill to</div><b>${h(g.name)}</b><div>${h(g.mobile)}</div>${g.address ? `<div class="td-small">${h(g.address)}</div>` : ''}</div>
+        <div><div class="td-small">Stay</div><b>Bed ${h(g.bed)}</b><div>${fmtDate(g.check_in)} → ${fmtDate(g.check_out)}</div>
+          <div class="td-small">${rupees(g.rate)} / ${g.rate_per} · ${h(g.status)}</div></div>
+      </div>
+      <div class="table-wrap"><table class="report-table">
+        <thead><tr><th>#</th><th>Description</th>${hasGst ? '<th class="num">GST</th><th class="num">Taxable</th><th class="num">GST amt</th>' : ''}<th class="num">Amount</th></tr></thead>
+        <tbody>${lines}</tbody>
+        ${hasGst ? `<tfoot>
+          <tr><td></td><td>Taxable value</td><td></td><td class="num">${rupees(b.totals.taxable)}</td><td></td><td></td></tr>
+          <tr><td></td><td>CGST ${rupees(b.totals.cgst)} + SGST ${rupees(b.totals.sgst)}</td><td></td><td></td><td class="num">${rupees(b.totals.gst)}</td><td></td></tr>
+        </tfoot>` : ''}
+      </table></div>
+      <div class="bill-sum">
+        <div><span>Total billed</span><b>${rupees(b.totals.amount)}</b></div>
+        ${b.discount ? `<div><span>Discount</span><b>− ${rupees(b.discount)}</b></div>` : ''}
+        <div><span>Paid</span><b>− ${rupees(b.paid)}</b></div>
+        ${b.deposit.adjusted ? `<div><span>Adjusted from deposit</span><b>− ${rupees(b.deposit.adjusted)}</b></div>` : ''}
+        <div class="bill-bal ${owes ? 'owes' : ''}"><span>${owes ? 'Balance due' : adv ? 'Advance with us' : 'Balance'}</span><b>${rupees(Math.abs(b.balance))}</b></div>
+        ${b.deposit.received ? `<div class="td-small"><span>Security deposit: received ${rupees(b.deposit.received)}${b.deposit.refunded ? `, refunded ${rupees(b.deposit.refunded)}` : ''} · held ${rupees(b.deposit.held)}</span></div>` : ''}
+      </div>
+      ${b.payments.length ? `<div class="section-title">Payments</div>
+        <table class="report-table compact"><tbody>${b.payments.map(p => `<tr><td>${fmtDate(p.date)}</td><td>${h(p.what)}</td><td>${h(p.mode)}</td><td class="num">${rupees(p.amount)}</td></tr>`).join('')}</tbody></table>` : ''}
+      <footer class="rep-foot">This is a computer-generated ${b.title.toLowerCase()} · DormBook</footer>
+    </article>`, { wide: true });
+}
+
+function printBill() {
+  document.body.classList.add('printing-bill');
+  const done = () => { document.body.classList.remove('printing-bill'); window.removeEventListener('afterprint', done); };
+  window.addEventListener('afterprint', done);
+  window.print();
+  setTimeout(done, 2000);
 }
 
 function fmtCell(v, type) {
@@ -1677,18 +1908,7 @@ function reportDocument(rep) {
       <button class="btn btn-outline btn-sm" onclick="downloadReportCsv()">⬇ Excel (CSV)</button>
     </div>
     <article class="report-doc">
-      <header class="letterhead">
-        <div>
-          <div class="lh-name">${h(c.business_name)}</div>
-          ${c.property_name && c.property_name !== c.business_name ? `<div class="lh-sub">${h(c.property_name)}</div>` : ''}
-          <div class="lh-addr">${h(c.address || 'Add your address in Settings')}</div>
-          <div class="lh-addr">${[c.phone && `Ph: ${h(c.phone)}`, c.email && h(c.email), c.gstin && `GSTIN: ${h(c.gstin)}`].filter(Boolean).join(' · ')}</div>
-        </div>
-        <div class="lh-right">
-          <div class="lh-title">${h(rep.title)}</div>
-          <div>${period}</div>
-        </div>
-      </header>
+      ${letterhead(c, rep.title, period)}
       ${rep.summary && rep.summary.length ? `<div class="rep-summary">${rep.summary.map(x => `<div><span>${h(x.label)}</span><b>${fmtCell(x.value, x.type)}</b></div>`).join('')}</div>` : ''}
       <div class="table-wrap"><table class="report-table">
         <thead><tr>${cols.map(col => `<th class="${['money', 'number', 'pct'].includes(col.type) ? 'num' : ''}">${h(col.label)}</th>`).join('')}</tr></thead>
@@ -1888,14 +2108,15 @@ async function submitDiscount(residentId) {
 }
 
 // ── Property Settings (owner only) ────────────────────────────
-// ── Settings → Business (letterhead + simple rules) ───────────
+// ── Settings → Business (details, GST, advanced rules) ─────────
 async function renderSettings(el) {
   const st = await api('GET', '/properties/settings');
   const rs = (p) => ((p || 0) / 100);
+  const rateOpts = (sel) => GST_RATES.map(r => `<option value="${r * 100}" ${r * 100 === sel ? 'selected' : ''}>${r}%</option>`).join('');
   el.innerHTML = `
     <div class="card mb-20">
-      <strong>Business details</strong>
-      <p class="td-small mt-4">Printed at the top of every report and receipt.</p>
+      <strong>Your business</strong>
+      <p class="td-small mt-4">Printed at the top of reports and bills.</p>
       <div class="field-row mt-12">
         <div class="field"><label for="ps-company">Company name *</label><input id="ps-company" maxlength="120" value="${h(st.business_name || '')}" placeholder="e.g. A&P Infotech Solutions Pvt Ltd" /></div>
         <div class="field"><label for="ps-name">Dormitory name *</label><input id="ps-name" maxlength="120" value="${h(st.name || '')}" /></div>
@@ -1906,27 +2127,54 @@ async function renderSettings(el) {
         <div class="field"><label for="ps-state">State</label><input id="ps-state" maxlength="60" value="${h(st.state || '')}" /></div>
         <div class="field"><label for="ps-pin">PIN code</label><input id="ps-pin" value="${h(st.pincode || '')}" inputmode="numeric" maxlength="6" /></div>
       </div>
-      <div class="field-row three">
+      <div class="field-row">
         <div class="field"><label for="ps-phone">Phone</label><input id="ps-phone" value="${h(st.contact_phone || '')}" type="tel" maxlength="20" /></div>
         <div class="field"><label for="ps-email">Email</label><input id="ps-email" value="${h(st.contact_email || '')}" type="email" maxlength="120" /></div>
-        <div class="field"><label for="ps-gstin">GSTIN <span class="td-small">(optional)</span></label><input id="ps-gstin" value="${h(st.gstin || '')}" maxlength="15" style="text-transform:uppercase" /></div>
       </div>
     </div>
+
     <div class="card mb-20">
-      <strong>Rules</strong>
-      <div class="field-row mt-12">
-        <div class="field"><label for="ps-clean">Bed cleaning time (minutes)</label><input id="ps-clean" type="number" min="5" max="1440" value="${st.cleaning_timeout_minutes || 120}" />
-          <div class="field-note">After checkout a bed shows "cleaning". It becomes vacant by itself after this time.</div></div>
-        <div class="field"><label for="ps-lock">Hold a booked bed for (hours)</label><input id="ps-lock" type="number" min="1" max="720" value="${st.booking_lock_hours || 24}" />
-          <div class="field-note">An unconfirmed booking is released after this time.</div></div>
-      </div>
-      <div class="field-row">
-        <div class="field"><label for="ps-refund">Staff refunds above (₹) need approval</label><input id="ps-refund" type="number" min="0" step="1" value="${rs(st.refund_approval_threshold_paise)}" />
-          <div class="field-note">0 = every refund by staff needs approval.</div></div>
-        <div class="field"><label for="ps-cash">Cash difference allowed at close (₹)</label><input id="ps-cash" type="number" min="0" step="1" value="${rs(st.cash_reconciliation_tolerance_paise)}" />
-          <div class="field-note">A bigger difference must be explained.</div></div>
+      <label class="switch-row"><input type="checkbox" id="ps-gst-on" ${st.gst_enabled ? 'checked' : ''} onchange="document.getElementById('ps-gst-box').hidden=!this.checked" />
+        <span><strong>We charge GST</strong><br/><span class="td-small">Turn on after you get your GSTIN. Bills then show GST and the GST report fills up.</span></span></label>
+      <div id="ps-gst-box" ${st.gst_enabled ? '' : 'hidden'}>
+        <div class="field-row mt-12">
+          <div class="field"><label for="ps-gstin">GSTIN *</label><input id="ps-gstin" value="${h(st.gstin || '')}" maxlength="15" style="text-transform:uppercase" placeholder="07ABCDE1234F1Z5" /></div>
+          <div class="field"><label for="ps-rent-gst">GST on bed rent</label><select id="ps-rent-gst">${rateOpts(st.rent_gst_rate_bp || 0)}</select></div>
+        </div>
+        <div class="field"><label>Your bed rates…</label>
+          <div class="choice-row">
+            <label class="choice"><input type="radio" name="ps-rent-incl" value="1" ${st.rent_gst_inclusive !== 0 ? 'checked' : ''} /> already include GST</label>
+            <label class="choice"><input type="radio" name="ps-rent-incl" value="0" ${st.rent_gst_inclusive === 0 ? 'checked' : ''} /> GST is added on top</label>
+          </div>
+          <div class="field-note">Applies to guests who check in from now on. GST for tea, laundry etc. is set per item in Items &amp; Prices.
+            Room rent up to ₹7,500/day is usually 5%; long-stay hostel rent up to ₹20,000/month can be exempt (0%). Confirm with your CA.</div>
+        </div>
       </div>
     </div>
+
+    <details class="card mb-20 adv">
+      <summary><strong>More settings</strong> <span class="td-small">— you can leave these as they are</span></summary>
+      <div class="rule mt-12">
+        <label for="ps-clean">After a guest leaves, the bed is ready again in</label>
+        <div class="rule-in"><input id="ps-clean" type="number" min="5" max="1440" value="${st.cleaning_timeout_minutes || 120}" /><span>minutes</span></div>
+        <div class="field-note">Time for cleaning. You can also press "Ready" on the Today page sooner.</div>
+      </div>
+      <div class="rule">
+        <label for="ps-lock">Keep a booked bed for the guest for</label>
+        <div class="rule-in"><input id="ps-lock" type="number" min="1" max="720" value="${st.booking_lock_hours || 24}" /><span>hours</span></div>
+        <div class="field-note">If the guest doesn't come by then, the bed becomes free again.</div>
+      </div>
+      <div class="rule">
+        <label for="ps-refund">Staff can give money back up to</label>
+        <div class="rule-in"><span>₹</span><input id="ps-refund" type="number" min="0" step="1" value="${rs(st.refund_approval_threshold_paise)}" /></div>
+        <div class="field-note">More than this needs your OK. Keep 0 if you want to OK every refund.</div>
+      </div>
+      <div class="rule">
+        <label for="ps-cash">When counting cash at night, a difference up to this is fine</label>
+        <div class="rule-in"><span>₹</span><input id="ps-cash" type="number" min="0" step="1" value="${rs(st.cash_reconciliation_tolerance_paise)}" /></div>
+        <div class="field-note">If cash is short or extra by more than this, staff must write why.</div>
+      </div>
+    </details>
     <div id="ps-error" class="error-msg hidden"></div>
     <button class="btn btn-primary" id="ps-save" onclick="submitSettings()">Save settings</button>`;
 }
@@ -1939,18 +2187,24 @@ async function submitSettings() {
   try {
     if (!v('ps-company')) throw new Error('Company name cannot be empty');
     if (!v('ps-name')) throw new Error('Dormitory name cannot be empty');
+    const gstOn = document.getElementById('ps-gst-on').checked;
+    if (gstOn && !v('ps-gstin')) throw new Error('Type your GSTIN to charge GST');
     for (const [id, label] of [['ps-clean', 'Cleaning time'], ['ps-lock', 'Booking hold'], ['ps-refund', 'Refund limit'], ['ps-cash', 'Cash difference']]) {
-      if (v(id) === '' || Number.isNaN(int(id)) || int(id) < 0) throw new Error(`${label}: type a number (0 or more)`);
+      if (v(id) === '' || Number.isNaN(int(id)) || int(id) < 0) throw new Error(`${label} (in More settings): type a number (0 or more)`);
     }
     await api('PATCH', '/properties/settings', {
       business_name: v('ps-company'), name: v('ps-name'),
       address: v('ps-address'), city: v('ps-city'), state: v('ps-state'), pincode: v('ps-pin'),
       contact_phone: v('ps-phone'), contact_email: v('ps-email'), gstin: v('ps-gstin'),
+      gst_enabled: gstOn,
+      rent_gst_rate_bp: Number(v('ps-rent-gst')),
+      rent_gst_inclusive: document.querySelector('input[name="ps-rent-incl"]:checked')?.value !== '0',
       cleaning_timeout_minutes: int('ps-clean'),
       booking_lock_hours: int('ps-lock'),
       refund_approval_threshold_paise: int('ps-refund') * 100,
       cash_reconciliation_tolerance_paise: int('ps-cash') * 100,
     });
+    await getProfile(true).catch(() => {});
     toast('Settings saved', 'success');
     renderPage('settings');
   } catch (ex) { err.textContent = ex.message; err.classList.remove('hidden'); btn.disabled = false; }
@@ -2091,9 +2345,12 @@ async function resolveFeedback(id) {
 const ITEM_CATEGORIES = ['Food & drinks', 'Laundry', 'Services', 'Items', 'Other'];
 
 async function renderCatalog(el) {
-  const items = await api('GET', '/addons/catalog?all=1');
+  const [items, prof] = await Promise.all([api('GET', '/addons/catalog?all=1'), getProfile(true).catch(() => ({}))]);
+  const gstOn = !!prof.gst_enabled;
   const active = items.filter(i => i.is_active), hidden = items.filter(i => !i.is_active);
   const catOpts = (sel) => ITEM_CATEGORIES.map(c => `<option ${c === sel ? 'selected' : ''}>${h(c)}</option>`).join('');
+  const rateOpts = (sel) => GST_RATES.map(r => `<option value="${r * 100}" ${r * 100 === (sel || 0) ? 'selected' : ''}>${r}%</option>`).join('');
+  const inclOpts = (incl) => `<option value="1" ${incl ? 'selected' : ''}>Price includes GST</option><option value="0" ${incl ? '' : 'selected'}>Add GST on top</option>`;
   el.innerHTML = `
     <div class="card mb-20">
       <strong>Items guests can buy</strong>
@@ -2104,6 +2361,10 @@ async function renderCatalog(el) {
         <div class="field"><label for="cat-price">Price (₹) *</label><input id="cat-price" type="number" min="0" step="1" inputmode="numeric" placeholder="e.g. 10" /></div>
         <div class="field"><label for="cat-cat">Type</label><select id="cat-cat">${catOpts('Food & drinks')}</select></div>
       </div>
+      ${gstOn ? `<div class="field-row">
+        <div class="field"><label for="cat-gst">GST</label><select id="cat-gst">${rateOpts(500)}</select></div>
+        <div class="field"><label for="cat-incl">Price</label><select id="cat-incl">${inclOpts(true)}</select></div>
+      </div>` : `<p class="td-small">GST is off. To add GST to items, turn it on in Settings → Business.</p>`}
       <div id="cat-error" class="error-msg hidden"></div>
       <div class="btn-group mt-12">
         <button class="btn btn-primary" onclick="submitCatalogItem()">+ Add item</button>
@@ -2113,12 +2374,15 @@ async function renderCatalog(el) {
     ${active.length ? `
     <div class="card table-wrap">
       <table>
-        <thead><tr><th>Item</th><th>Type</th><th>Price (₹)</th><th></th></tr></thead>
+        <thead><tr><th>Item</th><th>Type</th><th>Price (₹)</th>${gstOn ? '<th>GST</th><th>Guest pays</th>' : ''}<th></th></tr></thead>
         <tbody>${active.map(i => `
           <tr>
             <td><input class="cell-input" id="ci-n-${i.id}" value="${h(i.name)}" maxlength="60" aria-label="Item name" /></td>
             <td><select class="cell-input" id="ci-c-${i.id}" aria-label="Type">${catOpts(i.category)}${ITEM_CATEGORIES.includes(i.category) ? '' : `<option selected>${h(i.category)}</option>`}</select></td>
             <td><input class="cell-input num" id="ci-p-${i.id}" type="number" min="0" step="1" value="${(i.default_price_paise / 100)}" aria-label="Price" /></td>
+            ${gstOn ? `<td class="nowrap"><select class="cell-input sm" id="ci-g-${i.id}" aria-label="GST rate">${rateOpts(i.gst_rate_bp)}</select>
+              <select class="cell-input" id="ci-i-${i.id}" aria-label="GST included?">${inclOpts(i.gst_inclusive !== 0)}</select></td>
+              <td class="num fw-bold">${rupees(gstSplit(i.default_price_paise, i.gst_rate_bp, i.gst_inclusive !== 0).gross)}</td>` : ''}
             <td class="actions">
               <button class="btn btn-outline btn-sm" onclick="saveCatalogItem('${i.id}')">Save</button>
               <button class="btn btn-outline btn-sm" onclick="setCatalogActive('${i.id}', false)">Remove</button>
@@ -2140,10 +2404,12 @@ async function submitCatalogItem() {
   const priceTxt = document.getElementById('cat-price').value;
   try {
     if (priceTxt === '' || !(parseFloat(priceTxt) >= 0)) throw new Error('Type a price (0 or more)');
+    const g = document.getElementById('cat-gst'), inc = document.getElementById('cat-incl');
     await api('POST', '/addons/catalog', {
       name:                document.getElementById('cat-name').value.trim(),
       category:            document.getElementById('cat-cat').value,
       default_price_paise: Math.round(parseFloat(priceTxt) * 100),
+      ...(g ? { gst_rate_bp: Number(g.value), gst_inclusive: inc.value === '1' } : {}),
     });
     toast('Item added', 'success'); renderPage('catalog');
   } catch (ex) { err.textContent = ex.message; err.classList.remove('hidden'); }
@@ -2153,10 +2419,12 @@ async function saveCatalogItem(id) {
   const priceTxt = document.getElementById(`ci-p-${id}`).value;
   try {
     if (priceTxt === '' || !(parseFloat(priceTxt) >= 0)) throw new Error('Type a price (0 or more)');
+    const g = document.getElementById(`ci-g-${id}`), inc = document.getElementById(`ci-i-${id}`);
     await api('PATCH', `/addons/catalog/${id}`, {
       name: document.getElementById(`ci-n-${id}`).value.trim(),
       category: document.getElementById(`ci-c-${id}`).value,
       default_price_paise: Math.round(parseFloat(priceTxt) * 100),
+      ...(g ? { gst_rate_bp: Number(g.value), gst_inclusive: inc.value === '1' } : {}),
     });
     toast('Saved', 'success'); renderPage('catalog');
   } catch (ex) { toast(ex.message, 'error'); }
