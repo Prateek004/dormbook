@@ -361,3 +361,69 @@ td.actions .btn + .btn { margin-left: 4px; }
 @media (min-width: 769px) { .field-row.three { grid-template-columns: repeat(3, 1fr); } }
 .field .choice { display: flex; align-items: center; gap: 8px; margin: 0; font-size: 14px; font-weight: 500; color: var(--gray-700); }
 .field .choice input { width: auto; margin: 0; padding: 0; box-shadow: none; accent-color: var(--primary); }
+
+/* ── GST / settings ── */
+.switch-row { display: flex; gap: 12px; align-items: flex-start; cursor: pointer; }
+.switch-row input { width: 20px; height: 20px; margin-top: 2px; accent-color: var(--primary); flex: none; }
+details.adv > summary { cursor: pointer; list-style: revert; }
+.item-btn em { font-style: normal; font-size: 11px; color: var(--gray-400); }
+.cell-input.sm { max-width: 72px; }
+.nowrap { white-space: nowrap; }
+.nowrap .cell-input { width: auto; display: inline-block; }
+
+/* ── Monthly summary ── */
+.kpis-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+@media (max-width: 900px) { .kpis-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.kpi.bad strong { color: var(--danger, #dc2626); }
+.month-pick { align-items: center; }
+.month-label { min-width: 150px; text-align: center; font-size: 15px; }
+.report-bar:has(.month-pick) { justify-content: space-between; align-items: center; }
+.sum-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+.sum-card { padding: 14px 16px; }
+.sum-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--gray-400); margin-bottom: 8px; }
+.report-table.compact td, .report-table.compact th { padding: 6px 8px; font-size: 13px; }
+.chart-legend { display: flex; gap: 16px; font-size: 12px; color: var(--gray-600); margin-bottom: 6px; }
+.chart-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }
+.trend { width: 100%; height: auto; display: block; overflow: visible; }
+.trend .grid { stroke: var(--gray-200); stroke-width: 1; }
+.trend .tick { font-size: 11px; fill: var(--gray-400); }
+.b-in { fill: #2a78d6; background: #2a78d6; }
+.b-ex { fill: #eb6834; background: #eb6834; }
+.trend .hit { fill: transparent; }
+.trend .bar-grp:hover .hit { fill: rgba(0,0,0,.035); }
+
+/* ── Guest bill ── */
+.bill-to { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 14px; font-size: 14px; }
+.bill-sum { margin: 14px 0 6px auto; max-width: 340px; display: grid; gap: 4px; font-size: 14px; }
+.bill-sum > div { display: flex; justify-content: space-between; gap: 12px; }
+.bill-bal { border-top: 1px solid var(--gray-200); padding-top: 6px; font-size: 16px; }
+.bill-bal.owes b { color: var(--danger, #dc2626); }
+@media (max-width: 560px) { .bill-to { grid-template-columns: 1fr; } }
+@media print {
+  body.printing-bill #main-app, body.printing-bill #loading-screen { display: none !important; }
+  body.printing-bill .modal-overlay { display: block !important; position: static; background: none; padding: 0; }
+  body.printing-bill .modal { max-width: none !important; max-height: none; overflow: visible; box-shadow: none; border-radius: 0; }
+  body.printing-bill .modal-header, body.printing-bill .no-print { display: none !important; }
+  body.printing-bill .modal-body { padding: 0; }
+  .b-in, .b-ex, .sw { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .kpis-4 { grid-template-columns: repeat(4, 1fr); }
+}
+select.cell-input:not(.sm) { min-width: 130px; }
+
+/* ── Change beds (edit layout) ── */
+.bed-wrap { position: relative; }
+.bed-wrap .bed-chip { width: 100%; }
+.bed-x { position: absolute; top: -7px; right: -7px; width: 22px; height: 22px; border-radius: 50%; border: 1px solid var(--gray-200); background: #fff; color: var(--danger); font-size: 11px; line-height: 1; cursor: pointer; box-shadow: var(--shadow); }
+.bed-x:hover { background: var(--danger); color: #fff; }
+.bunker.editing { border-style: dashed; border-color: var(--primary); }
+.bunker-tools { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.text-danger.btn { color: var(--danger); }
+
+/* ── Simple rules ── */
+.rule { padding: 12px 0; border-top: 1px solid var(--gray-200); }
+.rule:first-of-type { border-top: 0; }
+.rule label { display: block; font-size: 14px; font-weight: 500; color: var(--gray-700); margin-bottom: 6px; }
+.rule-in { display: flex; align-items: center; gap: 8px; max-width: 220px; }
+.rule-in input { width: 120px; padding: 8px 10px; border: 1px solid var(--gray-200); border-radius: var(--radius); font: inherit; }
+.rule-in span { color: var(--gray-600); font-size: 14px; }
