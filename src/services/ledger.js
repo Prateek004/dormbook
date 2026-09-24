@@ -78,6 +78,8 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
   origin        TEXT NOT NULL DEFAULT 'app' CHECK (origin IN ('app','billing','migration')),
   reason        TEXT,
   user_id       TEXT,
+  tax_rate_bp   INTEGER,
+  tax_paise     INTEGER,
   CHECK ((reversal_of IS NULL AND amount_paise > 0) OR (reversal_of IS NOT NULL AND amount_paise < 0)),
   CHECK (kind NOT IN ('PAYMENT','DEPOSIT_IN','DEPOSIT_REFUND','EXPENSE','CREDIT_REFUND') OR mode IS NOT NULL),
   CHECK (kind IN ('EXPENSE','BANK_DEPOSIT') OR resident_id IS NOT NULL),
@@ -193,6 +195,24 @@ function prorate({ plan, ratePaise, start, end, anchor = start }) {
   return fullCycles * ratePaise + Math.round(partial);
 }
 
+/**
+ * GST on a price. rateBp is basis points (500 = 5%).
+ *  inclusive: the price already contains GST → gross = price, tax taken out of it
+ *  exclusive: GST is added on top            → gross = price + tax
+ * Returns whole paise: { gross, tax, taxable } with gross = taxable + tax.
+ */
+const GST_RATES_BP = [0, 500, 1200, 1800, 2800, 4000];
+function gstSplit(pricePaise, rateBp, inclusive = true) {
+  const price = Number(pricePaise);
+  const r = Number(rateBp) || 0;
+  if (!Number.isSafeInteger(price) || price < 0) throw new LedgerError('BAD_AMOUNT', 'price must be a whole number of paise');
+  if (!GST_RATES_BP.includes(r)) throw new LedgerError('BAD_GST', 'GST rate must be 0, 5, 12, 18, 28 or 40%');
+  if (!r) return { gross: price, tax: 0, taxable: price };
+  const tax = inclusive ? Math.round((price * r) / (10000 + r)) : Math.round((price * r) / 10000);
+  const gross = inclusive ? price : price + tax;
+  return { gross, tax, taxable: gross - tax };
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Setup + one-time migration of existing data
 // ─────────────────────────────────────────────────────────────────────────────
@@ -226,8 +246,20 @@ function upgradeLedgerTable(db) {
   }
 }
 
+/** v3: GST columns (tax_rate_bp, tax_paise). Plain ADD COLUMN — no rebuild needed. */
+function addTaxColumns(db) {
+  const have = db.prepare("SELECT name FROM pragma_table_info('ledger_entries')").all().map((c) => c.name);
+  for (const col of ['tax_rate_bp', 'tax_paise']) {
+    if (!have.includes(col)) {
+      db.exec(`ALTER TABLE ledger_entries ADD COLUMN ${col} INTEGER`);
+      console.log(`[LEDGER] Added ledger_entries.${col}`);
+    }
+  }
+}
+
 function setupLedger(db = getDb()) {
   db.exec(SCHEMA);
+  addTaxColumns(db);
   upgradeLedgerTable(db);
   try {
     backfillOnce(db);
@@ -359,7 +391,7 @@ function backfillOnce(db) {
 // ─────────────────────────────────────────────────────────────────────────────
 const COLS = ['id', 'property_id', 'resident_id', 'biz_date', 'ref_date', 'created_at', 'kind', 'category', 'mode',
   'amount_paise', 'period_start', 'period_end', 'plan', 'rate_paise', 'reversal_of', 'idem_key', 'source_table',
-  'source_id', 'origin', 'reason', 'user_id'];
+  'source_id', 'origin', 'reason', 'user_id', 'tax_rate_bp', 'tax_paise'];
 let _insertSql = null;
 
 function insertRow(db, row) {
@@ -478,11 +510,16 @@ function billResident(db, r, { asOf = istDate(), until = null, origin = 'billing
     let end = nextCycleStart(plan, cursor, anchor);
     if (isValidDate(r.expected_checkout) && r.expected_checkout > cursor && r.expected_checkout < end) end = r.expected_checkout;
     if (hardStop && hardStop < end) end = hardStop;
-    const amount = prorate({ plan, ratePaise: rate, start: cursor, end, anchor });
+    const base = prorate({ plan, ratePaise: rate, start: cursor, end, anchor });
+    // GST settings were copied onto the resident at check-in, so a stay is billed
+    // the way it was quoted even if the owner changes the GST setting later.
+    const g = gstSplit(base, Number(r.gst_rate_bp) || 0, r.gst_inclusive !== 0);
+    const amount = g.gross;
     if (amount > 0) {
       insertRow(db, {
         property_id: r.property_id, resident_id: r.id, biz_date: openBizDate(db, r.property_id, cursor), ref_date: cursor,
-        kind: 'CHARGE', category: 'rent', amount_paise: amount, period_start: cursor, period_end: end, plan,
+        kind: 'CHARGE', category: 'rent', amount_paise: amount, tax_rate_bp: Number(r.gst_rate_bp) || 0, tax_paise: g.tax,
+        period_start: cursor, period_end: end, plan,
         rate_paise: rate, idem_key: `rent:${r.id}:${cursor}:${end}:${origin === 'migration' ? 'm' : 'b'}${lastReversalCount(db, r.id, cursor)}`,
         origin, user_id: userId, reason: `${plan} rent ${cursor} → ${end}`,
       });
@@ -530,11 +567,14 @@ function settleRentAtCheckout(db, resident, checkoutDate, userId) {
     reverseEntry(db, c, `Checkout on ${checkoutDate}`, userId);
     if (c.period_start < stayEnd) {
       const plan = c.plan || 'monthly';
-      const amount = prorate({ plan, ratePaise: c.rate_paise || c.amount_paise, start: c.period_start,
+      const base = prorate({ plan, ratePaise: c.rate_paise || c.amount_paise, start: c.period_start,
         end: stayEnd, anchor: billingAnchor(resident, plan) });
+      const rateBp = c.rate_paise ? (Number(c.tax_rate_bp) || 0) : 0;
+      const g = gstSplit(base, rateBp, resident.gst_inclusive !== 0);
       insertRow(db, {
         property_id: c.property_id, resident_id: c.resident_id, biz_date: openBizDate(db, c.property_id), ref_date: c.period_start,
-        kind: 'CHARGE', category: 'rent', amount_paise: amount, period_start: c.period_start, period_end: stayEnd,
+        kind: 'CHARGE', category: 'rent', amount_paise: g.gross, tax_rate_bp: rateBp, tax_paise: g.tax,
+        period_start: c.period_start, period_end: stayEnd,
         plan: c.plan, rate_paise: c.rate_paise, origin: 'app', user_id: userId,
         reason: `${c.plan} rent ${c.period_start} → ${stayEnd} (checkout)`,
       });
@@ -565,6 +605,14 @@ const api = {
     const row = tenantRow(db, p, 'CHARGE');
     row.category = String(p.category || 'other').slice(0, 40);
     if (row.category === 'rent') throw new LedgerError('USE_BILLING', 'Rent is charged automatically by billing');
+    if (p.taxRateBp !== undefined && p.taxRateBp !== null) {
+      const t = Number(p.taxPaise) || 0;
+      if (!GST_RATES_BP.includes(Number(p.taxRateBp)) || !Number.isSafeInteger(t) || t < 0 || t >= row.amount_paise) {
+        throw new LedgerError('BAD_GST', 'GST amount is not valid');
+      }
+      row.tax_rate_bp = Number(p.taxRateBp);
+      row.tax_paise = t;
+    }
     return insertRow(db, row);
   },
 
@@ -819,6 +867,7 @@ function reverseEntry(db, o, reason, userId) {
     property_id: o.property_id, resident_id: o.resident_id, biz_date: openBizDate(db, o.property_id), ref_date: o.ref_date,
     kind: o.kind, category: o.category, mode: o.mode, amount_paise: -o.amount_paise, period_start: o.period_start,
     period_end: o.period_end, plan: o.plan, rate_paise: o.rate_paise, reversal_of: o.id,
+    tax_rate_bp: o.tax_rate_bp == null ? null : o.tax_rate_bp, tax_paise: o.tax_paise == null ? null : -o.tax_paise,
     source_table: o.source_table, source_id: o.source_id, origin: 'app', user_id: userId || null,
     reason: `Reversal: ${String(reason).trim()}`,
   });
@@ -827,6 +876,6 @@ function reverseEntry(db, o, reason, userId) {
 }
 
 module.exports = {
-  ...api, setupLedger, runBilling, prorate, billingAnchor, nextCycleStart, addMonthsAnchored, openBizDate,
+  ...api, setupLedger, runBilling, prorate, gstSplit, GST_RATES_BP, billingAnchor, nextCycleStart, addMonthsAnchored, openBizDate,
   LedgerError, SQL, MODES, KINDS, PLANS,
 };
