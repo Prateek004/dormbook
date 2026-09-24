@@ -29,7 +29,7 @@ function getDashboard(req, res) {
       SUM(CASE WHEN status='reserved'  THEN 1 ELSE 0 END) as reserved,
       SUM(CASE WHEN status='pending'   THEN 1 ELSE 0 END) as pending,
       COUNT(*)                                              as total
-    FROM beds WHERE property_id = ?
+    FROM beds WHERE property_id = ? AND removed_at IS NULL
   `).get(propertyId);
 
   const activeResidents = db.prepare(
@@ -252,6 +252,17 @@ function updatePropertySettings(req, res) {
     set.gstin = v || null;
   }
   if (has('whatsapp_number')) set.whatsapp_number = text('whatsapp_number', 20) || null;
+  if (has('gst_enabled')) set.gst_enabled = b.gst_enabled ? 1 : 0;
+  if (has('rent_gst_inclusive')) set.rent_gst_inclusive = b.rent_gst_inclusive ? 1 : 0;
+  if (has('rent_gst_rate_bp')) {
+    const n = Number(b.rent_gst_rate_bp);
+    if (![0, 500, 1200, 1800, 2800, 4000].includes(n)) return res.status(400).json({ error: 'GST on rent must be 0, 5, 12, 18, 28 or 40%' });
+    set.rent_gst_rate_bp = n;
+  }
+  // Turning GST on needs a GSTIN (either sent now or already saved).
+  const willBeOn = set.gst_enabled !== undefined ? set.gst_enabled : prop.gst_enabled;
+  const gstinAfter = set.gstin !== undefined ? set.gstin : prop.gstin;
+  if (willBeOn && !gstinAfter) return res.status(400).json({ error: 'Add your GSTIN to charge GST' });
 
   const ints = [
     ['cleaning_timeout_minutes', 5, 1440, 'Cleaning time must be 5 to 1440 minutes'],
@@ -301,6 +312,8 @@ function getPropertyProfile(req, res) {
     business_name: acc ? acc.business_name : p.name, property_name: p.name,
     address: p.address || '', city: p.city || '', state: p.state || '', pincode: p.pincode || '',
     phone: p.contact_phone || p.whatsapp_number || '', email: p.contact_email || '', gstin: p.gstin || '',
+    gst_enabled: !!p.gst_enabled, rent_gst_rate_bp: p.gst_enabled ? (p.rent_gst_rate_bp || 0) : 0,
+    rent_gst_inclusive: p.rent_gst_inclusive !== 0,
   });
 }
 
