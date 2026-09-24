@@ -18,7 +18,7 @@ function createBooking(req, res) {
   const lockHours = prop?.booking_lock_hours || 24;
   const lockExpires = new Date(Date.now() + lockHours * 3600 * 1000).toISOString();
 
-  const bed = db.prepare("SELECT * FROM beds WHERE id = ? AND property_id = ?").get(bed_id, propertyId);
+  const bed = db.prepare("SELECT * FROM beds WHERE id = ? AND property_id = ? AND removed_at IS NULL").get(bed_id, propertyId);
   if (!bed) return res.status(404).json({ error: 'Bed not found' });
   if (bed.status !== 'available') {
     return res.status(409).json({ error: `Bed is '${bed.status}' — only available beds can be booked` });
