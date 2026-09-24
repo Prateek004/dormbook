@@ -43,6 +43,12 @@ function startScheduler() {
 
   // ── 0. Rent billing — 00:05 every day, plus once now (catches up after downtime) ──
   cron.schedule('5 0 * * *', safe('rent-billing', runDailyBilling), { name: 'rent-billing', timezone: APP_TZ });
+
+  // Nightly database backup (DB_DIR/backups, newest 14 kept)
+  cron.schedule('15 3 * * *', safe('db-backup', () => {
+    const { dbPath } = require('../db/init');
+    require('../db/backup').backupDb(getDb(), dbPath, 'daily');
+  }), { name: 'db-backup', timezone: APP_TZ });
   setTimeout(safe('rent-billing-boot', runDailyBilling), 5000);
 
   // ── 1. Rent reminders — daily at 09:00 ──────────────────
@@ -135,7 +141,7 @@ function sendEodReport() {
         SUM(CASE WHEN status='occupied'  THEN 1 ELSE 0 END) as occupied,
         SUM(CASE WHEN status='available' THEN 1 ELSE 0 END) as available,
         COUNT(*) as total
-      FROM beds WHERE property_id=?
+      FROM beds WHERE property_id=? AND removed_at IS NULL
     `).get(prop.id);
 
     const overdue = db.prepare(`
