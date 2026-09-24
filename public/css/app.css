@@ -325,3 +325,39 @@ td.actions .btn + .btn { margin-left: 4px; }
   .header-actions { flex-wrap: wrap; }
 }
 .floor-tabs .td-small { color: inherit; opacity: .75; }
+
+/* ── Sub-tabs (Money / Reports / Settings) ── */
+.sub-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--gray-200); margin-bottom: 16px; overflow-x: auto; scrollbar-width: none; }
+.sub-tabs::-webkit-scrollbar { display: none; }
+.sub-tab { background: none; border: 0; border-bottom: 2px solid transparent; padding: 10px 14px; font: inherit; font-size: 14px; color: var(--gray-500, #6b7280); cursor: pointer; white-space: nowrap; margin-bottom: -1px; }
+.sub-tab:hover { color: var(--primary-dark); }
+.sub-tab.active { color: var(--primary-dark); border-bottom-color: var(--primary); font-weight: 600; }
+.sub-tab:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+
+/* ── Add item (tea, coffee…) ── */
+.item-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 8px; }
+.item-btn { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 10px 12px; border: 1px solid var(--gray-200); border-radius: var(--radius); background: #fff; cursor: pointer; font: inherit; text-align: left; }
+.item-btn:hover { border-color: var(--primary); background: var(--primary-light); }
+.item-btn:active { transform: scale(.98); }
+.item-btn span { font-size: 14px; } .item-btn b { font-size: 13px; color: var(--primary-dark); }
+.cart { width: 100%; border-collapse: collapse; font-size: 14px; }
+.cart td { padding: 8px 4px; border-bottom: 1px solid var(--gray-200); vertical-align: middle; }
+.cart tfoot td { border-bottom: 0; }
+.cart .qty { white-space: nowrap; text-align: center; }
+.cart .qty b { display: inline-block; min-width: 24px; text-align: center; }
+.cart .num { text-align: right; white-space: nowrap; }
+.choice-row { display: flex; gap: 16px; flex-wrap: wrap; }
+.choice { display: flex; align-items: center; gap: 6px; font-weight: 400; cursor: pointer; }
+.cell-input { width: 100%; min-width: 70px; padding: 6px 8px; border: 1px solid var(--gray-200); border-radius: var(--radius); font: inherit; font-size: 14px; background: #fff; }
+.cell-input.num { max-width: 110px; }
+.mt-4 { margin-top: 4px; }
+
+/* ── Change bed names ── */
+.rename-list { display: grid; gap: 10px; max-height: 55vh; overflow-y: auto; padding-right: 4px; }
+.rename-bunker { border: 1px solid var(--gray-200); border-radius: var(--radius); padding: 10px; display: grid; grid-template-columns: 140px 1fr; gap: 10px; align-items: start; }
+.rename-beds { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 8px; }
+.rename-bunker .field { margin-bottom: 0; }
+@media (max-width: 560px) { .rename-bunker { grid-template-columns: 1fr; } }
+@media (min-width: 769px) { .field-row.three { grid-template-columns: repeat(3, 1fr); } }
+.field .choice { display: flex; align-items: center; gap: 8px; margin: 0; font-size: 14px; font-weight: 500; color: var(--gray-700); }
+.field .choice input { width: auto; margin: 0; padding: 0; box-shadow: none; accent-color: var(--primary); }
