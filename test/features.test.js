@@ -82,7 +82,7 @@ test('dormitory setup, ID proof, dashboard and reports', async () => {
     assert.equal(r.body.tasks.collect_dues.count, 1);
     r = await call('GET', '/reports/registers');
     const ids = r.body.map((x) => x.id);
-    assert.deepEqual(ids.sort(), ['cash', 'collections', 'deposits', 'dues', 'expenses', 'guests', 'occupancy', 'pnl']);
+    assert.deepEqual(ids.sort(), ['cash', 'collections', 'deposits', 'dues', 'expenses', 'gst', 'guests', 'occupancy', 'pnl']);
     for (const id of ids) {
       r = await call('GET', `/reports/registers/${id}?from=${addDays(TODAY, -7)}&to=${TODAY}`);
       assert.equal(r.status, 200, `${id}: ${JSON.stringify(r.body)}`);
