@@ -277,7 +277,10 @@ function addBunkers(req, res) {
 
   const prefix = String(floor.floor_number);
   const existing = db.prepare('SELECT room_number FROM rooms WHERE floor_id = ?').all(floor.id).map((r) => r.room_number);
-  const taken = new Set(db.prepare('SELECT room_number FROM rooms WHERE property_id = ?').all(propertyId).map((r) => r.room_number));
+  const taken = new Set(db.prepare('SELECT room_number FROM rooms WHERE property_id = ?').all(propertyId).map((r) => r.room_number.toUpperCase()));
+  // Beds may have been renamed by the owner (e.g. 0A1 -> 0B2), so an auto name
+  // is skipped if ANY of its bed names is already used anywhere in the property.
+  const bedTaken = new Set(db.prepare('SELECT bed_label FROM beds WHERE property_id = ?').all(propertyId).map((b) => b.bed_label.toUpperCase()));
   const created = [];
   const now = new Date().toISOString();
 
@@ -285,7 +288,9 @@ function addBunkers(req, res) {
     let i = 0;
     while (created.length < count) {
       const name = prefix + bunkerLetter(i++);
-      if (taken.has(name) || existing.includes(name)) continue;
+      if (i > 2000) throw new Error('Could not find free bunker names');
+      if (taken.has(name.toUpperCase()) || existing.includes(name)) continue;
+      if (Array.from({ length: perBunker }, (_, k) => `${name}${k + 1}`.toUpperCase()).some((l) => bedTaken.has(l))) continue;
       const roomId = uuidv4();
       db.prepare("INSERT INTO rooms (id, floor_id, property_id, room_number, room_type, created_at) VALUES (?,?,?,?,'dormitory',?)")
         .run(roomId, floor.id, propertyId, name, now);
@@ -296,7 +301,8 @@ function addBunkers(req, res) {
           VALUES (?,?,?,?,?,?,'available',?,?)`).run(uuidv4(), roomId, propertyId, label, rate, rate, now, now);
         beds.push(label);
       }
-      taken.add(name);
+      taken.add(name.toUpperCase());
+      beds.forEach((l) => bedTaken.add(l.toUpperCase()));
       created.push({ bunker: name, beds });
     }
   })();
@@ -306,4 +312,79 @@ function addBunkers(req, res) {
   return res.status(201).json({ floor: floor.label, created, total_beds: created.length * perBunker });
 }
 
-module.exports = { listBeds, getBed, updateBedStatus, updateBedRate, bulkUpdateBedRate, createBed, listFloors, addFloor, addRoom, addBunkers, bunkerLetter };
+/**
+ * PATCH /api/v1/beds/names — rename floors, bunkers and beds in one go.
+ * Body: { floors: [{id, label}], rooms: [{id, name}], beds: [{id, label}] }
+ * All-or-nothing: every name is checked first, then everything is saved in
+ * one transaction. Bed names and bunker names must be unique in the property
+ * (ignoring upper/lower case). Money records are linked by id, so renaming
+ * never breaks bills or history — reports simply show the new name.
+ */
+const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9 \-_./#]{0,19}$/;
+function cleanName(v) { return String(v == null ? '' : v).replace(/\s+/g, ' ').trim(); }
+
+function renameNames(req, res) {
+  const db = getDb();
+  const propertyId = req.user.property_id;
+  const asList = (v) => (Array.isArray(v) ? v : []);
+  const floorsIn = asList(req.body.floors), roomsIn = asList(req.body.rooms), bedsIn = asList(req.body.beds);
+  if (!floorsIn.length && !roomsIn.length && !bedsIn.length) return res.status(400).json({ error: 'Nothing to rename' });
+  if (floorsIn.length + roomsIn.length + bedsIn.length > 2000) return res.status(400).json({ error: 'Too many changes at once' });
+
+  const bad = (msg) => res.status(400).json({ error: msg });
+
+  // Load current names so we can check the final result for duplicates.
+  const floors = new Map(db.prepare('SELECT id, label FROM floors WHERE property_id = ?').all(propertyId).map((f) => [f.id, f]));
+  const rooms  = new Map(db.prepare('SELECT id, room_number FROM rooms WHERE property_id = ?').all(propertyId).map((r) => [r.id, { ...r }]));
+  const beds   = new Map(db.prepare('SELECT id, bed_label FROM beds WHERE property_id = ?').all(propertyId).map((b) => [b.id, { ...b }]));
+
+  const floorChanges = [], roomChanges = [], bedChanges = [];
+  for (const f of floorsIn) {
+    const cur = floors.get(String(f && f.id));
+    if (!cur) return bad('Floor not found');
+    const label = cleanName(f.label);
+    if (!label || label.length > 40) return bad('Floor name must be 1–40 characters');
+    if (label !== cur.label) floorChanges.push({ id: cur.id, label });
+  }
+  for (const r of roomsIn) {
+    const cur = rooms.get(String(r && r.id));
+    if (!cur) return bad('Bunker not found');
+    const name = cleanName(r.name);
+    if (!NAME_RE.test(name)) return bad(`Bunker name "${name}" is not valid. Use 1–20 letters, numbers, space or - _ . / #`);
+    if (name !== cur.room_number) { roomChanges.push({ id: cur.id, name }); cur.room_number = name; }
+  }
+  for (const b of bedsIn) {
+    const cur = beds.get(String(b && b.id));
+    if (!cur) return bad('Bed not found');
+    const label = cleanName(b.label);
+    if (!NAME_RE.test(label)) return bad(`Bed name "${label}" is not valid. Use 1–20 letters, numbers, space or - _ . / #`);
+    if (label !== cur.bed_label) { bedChanges.push({ id: cur.id, label, old: cur.bed_label }); cur.bed_label = label; }
+  }
+
+  const dup = (values) => {
+    const seen = new Set();
+    for (const v of values) { const k = v.toUpperCase(); if (seen.has(k)) return v; seen.add(k); }
+    return null;
+  };
+  const dupBed = dup([...beds.values()].map((b) => b.bed_label));
+  if (dupBed) return res.status(409).json({ error: `Bed name "${dupBed}" is used twice. Every bed needs its own name.` });
+  const dupRoom = dup([...rooms.values()].map((r) => r.room_number));
+  if (dupRoom) return res.status(409).json({ error: `Bunker name "${dupRoom}" is used twice. Every bunker needs its own name.` });
+
+  if (!floorChanges.length && !roomChanges.length && !bedChanges.length) return res.json({ changed: 0 });
+
+  db.transaction(() => {
+    const now = new Date().toISOString();
+    for (const f of floorChanges) db.prepare('UPDATE floors SET label = ? WHERE id = ? AND property_id = ?').run(f.label, f.id, propertyId);
+    for (const r of roomChanges)  db.prepare('UPDATE rooms SET room_number = ? WHERE id = ? AND property_id = ?').run(r.name, r.id, propertyId);
+    for (const b of bedChanges)   db.prepare('UPDATE beds SET bed_label = ?, updated_at = ? WHERE id = ? AND property_id = ?').run(b.label, now, b.id, propertyId);
+  })();
+
+  try {
+    writeAudit({ propertyId, userId: req.user.id, action: 'BED_NAMES_CHANGED', entityType: 'beds', entityId: propertyId,
+      snapshot: { floors: floorChanges, rooms: roomChanges, beds: bedChanges.map((b) => ({ id: b.id, from: b.old, to: b.label })) }, ip: req.ip });
+  } catch (e) { console.error('[AUDIT] rename:', e.message); }
+  return res.json({ changed: floorChanges.length + roomChanges.length + bedChanges.length });
+}
+
+module.exports = { renameNames, listBeds, getBed, updateBedStatus, updateBedRate, bulkUpdateBedRate, createBed, listFloors, addFloor, addRoom, addBunkers, bunkerLetter };
