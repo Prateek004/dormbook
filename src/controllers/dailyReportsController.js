@@ -67,7 +67,7 @@ function snapshot(req, res) {
       SUM(CASE WHEN status='reserved' THEN 1 ELSE 0 END) reserved,
       SUM(CASE WHEN status='cleaning' THEN 1 ELSE 0 END) cleaning,
       SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) pending
-    FROM beds WHERE property_id = ?`).get(pid);
+    FROM beds WHERE property_id = ? AND removed_at IS NULL`).get(pid);
   const total = beds.total || 0;
 
   const moves = db.prepare(`SELECT
@@ -127,7 +127,7 @@ function bedMap(req, res) {
     JOIN rooms rm ON rm.id = b.room_id
     JOIN floors f ON f.id = rm.floor_id
     LEFT JOIN residents r ON r.bed_id = b.id AND r.status = 'active'
-    WHERE b.property_id = ?
+    WHERE b.property_id = ? AND b.removed_at IS NULL
     ORDER BY f.floor_number, rm.room_number, b.bed_label`).all(pid);
   const bal = req.user.role === 'reception' ? new Map() : balancesByResident(db, pid);
   const today = istDate();
@@ -330,10 +330,10 @@ function today(req, res) {
 
   const beds = db.prepare(`SELECT COUNT(*) total,
       SUM(status='occupied') occupied, SUM(status='available') available, SUM(status='cleaning') cleaning,
-      SUM(status='reserved') reserved FROM beds WHERE property_id = ?`).get(pid);
+      SUM(status='reserved') reserved FROM beds WHERE property_id = ? AND removed_at IS NULL`).get(pid);
   const leavingToday = db.prepare(`${base} AND r.expected_checkout = ? ORDER BY b.bed_label`).all(pid, d);
   const overstaying = db.prepare(`${base} AND r.expected_checkout < ? ORDER BY r.expected_checkout`).all(pid, d);
-  const cleaning = db.prepare(`SELECT id, bed_label bed, cleaning_started_at FROM beds WHERE property_id = ? AND status = 'cleaning' ORDER BY bed_label`).all(pid);
+  const cleaning = db.prepare(`SELECT id, bed_label bed, cleaning_started_at FROM beds WHERE property_id = ? AND status = 'cleaning' AND removed_at IS NULL ORDER BY bed_label`).all(pid);
   const arrivals = db.prepare(`SELECT br.id, br.prospect_name, br.prospect_phone, br.lock_expires_at, b.bed_label bed
     FROM booking_requests br LEFT JOIN beds b ON b.id = br.bed_id
     WHERE br.property_id = ? AND br.status IN ('pending','confirmed') ORDER BY br.lock_expires_at`).all(pid);
