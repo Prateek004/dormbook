@@ -457,3 +457,35 @@ html, body { font-size: 15px; }
 .btn { min-height: 38px; }
 .btn-sm { min-height: 32px; }
 @media (max-width: 768px) { .page-content { padding: 16px; } }
+
+/* ── Staff sign-in, login codes ── */
+.info-msg { background: #dbeafe; color: #1e40af; padding: 8px 12px; border-radius: var(--radius); font-size: 13px; margin: 8px 0; }
+.staff-link { font-weight: 600; }
+#mp-sms { display: inline-block; margin-top: 6px; }
+.code-big { font-size: 40px; font-weight: 800; letter-spacing: 6px; text-align: center; background: var(--primary-light); color: var(--primary-dark);
+  border-radius: 12px; padding: 16px 8px; margin: 16px 0 6px; font-variant-numeric: tabular-nums; }
+.text-center { text-align: center; }
+.btn-group.center { justify-content: center; }
+.btn-whatsapp { background: #25d366; color: #fff; }
+.btn-whatsapp:hover:not(:disabled) { background: #1ebe5b; }
+
+/* ── Bill: banners + pay block ── */
+.done-banner { background: #dcfce7; color: #166534; padding: 10px 14px; border-radius: var(--radius); margin-bottom: 12px; font-weight: 600; }
+.warn-banner { background: #fef9c3; color: #854d0e; padding: 10px 14px; border-radius: var(--radius); margin-bottom: 12px; }
+.warn-banner a { color: inherit; font-weight: 700; }
+.pay-box { display: flex; gap: 18px; align-items: center; border: 2px dashed var(--primary); border-radius: 12px; padding: 14px; margin-top: 18px; break-inside: avoid; }
+.pay-qr svg { width: 150px; height: 150px; display: block; }
+.pay-title { font-size: 16px; font-weight: 700; margin-bottom: 4px; }
+.pay-bank { margin-top: 6px; color: var(--gray-600); }
+.pay-empty { margin-top: 16px; padding: 10px 14px; border: 1px dashed var(--gray-200); border-radius: var(--radius); color: var(--gray-600); font-size: 13px; }
+@media (max-width: 560px) { .pay-box { flex-direction: column; align-items: flex-start; } }
+@media print { .pay-box { -webkit-print-color-adjust: exact; print-color-adjust: exact; } }
+
+/* ── My Account ── */
+.acc-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+.qr-preview { width: 180px; min-height: 60px; }
+.qr-preview svg { width: 180px; height: 180px; display: block; border: 1px solid var(--gray-200); border-radius: 8px; }
+@media (max-width: 768px) { .acc-grid { grid-template-columns: 1fr; } }
+.auth-links { display: flex; flex-direction: column; align-items: center; gap: 10px; margin-top: 18px; font-size: 14px; text-align: center; }
+.auth-links a { color: var(--primary-dark); }
+.pay-to { color: var(--gray-600); font-size: 13px; margin-bottom: 4px; }
