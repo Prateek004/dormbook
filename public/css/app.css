@@ -427,3 +427,33 @@ select.cell-input:not(.sm) { min-width: 130px; }
 .rule-in { display: flex; align-items: center; gap: 8px; max-width: 220px; }
 .rule-in input { width: 120px; padding: 8px 10px; border: 1px solid var(--gray-200); border-radius: var(--radius); font: inherit; }
 .rule-in span { color: var(--gray-600); font-size: 14px; }
+
+/* ── Cash change helper ── */
+.change-box { background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: var(--radius); padding: 12px 14px; margin: 4px 0 14px; }
+.change-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.change-row label { font-weight: 600; font-size: 14px; color: var(--gray-700); }
+.change-in { display: flex; align-items: center; gap: 6px; }
+.change-in span { font-size: 18px; color: var(--gray-600); }
+.change-in input { width: 130px; font-size: 20px; font-weight: 700; padding: 8px 10px; border: 1px solid var(--gray-200); border-radius: var(--radius); text-align: right; }
+.change-notes { display: flex; gap: 6px; flex-wrap: wrap; margin: 10px 0; }
+.note-btn { border: 1px solid var(--gray-200); background: #fff; border-radius: 20px; padding: 5px 12px; font: inherit; font-size: 13px; cursor: pointer; }
+.note-btn:hover { border-color: var(--primary); color: var(--primary-dark); }
+.change-out { display: flex; justify-content: space-between; align-items: baseline; font-size: 15px; padding-top: 8px; border-top: 1px dashed #bbf7d0; }
+.change-out b { font-size: 26px; }
+.change-out.give b { color: #047857; }
+.change-out.short b { color: var(--danger); }
+.change-out.exact b { color: #047857; }
+
+/* ── Roomier layout ── */
+html, body { font-size: 15px; }
+.nav-list li a { padding: 10px 14px; font-size: 14.5px; }
+.nav-list .nav-section { font-size: 11px; padding: 16px 20px 6px; }
+.nav-list .nav-section:first-child { padding-top: 6px; }
+.page-content { padding: 24px 28px; max-width: 1280px; }
+.page-header h2 { font-size: 18px; }
+.card { padding: 22px 24px; }
+.field { margin-bottom: 16px; }
+.field label { font-size: 13px; }
+.btn { min-height: 38px; }
+.btn-sm { min-height: 32px; }
+@media (max-width: 768px) { .page-content { padding: 16px; } }
