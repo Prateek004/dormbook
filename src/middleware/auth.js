@@ -24,14 +24,20 @@ function authenticate(req, res, next) {
   }
   const token = header.slice(7);
   try {
-    const payload = jwt.verify(token, getJwtSecret());
+    const payload = jwt.verify(token, getJwtSecret(), { algorithms: ['HS256'] });
     const db   = getDb();
-    const user = db.prepare(
-      'SELECT id, account_id, property_id, name, role, is_active FROM users WHERE id = ?'
-    ).get(payload.sub);
+    // SELECT * so this works before and after the pwd_changed_at column exists.
+    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(payload.sub);
 
     if (!user || !user.is_active) {
       return res.status(401).json({ error: 'User not found or deactivated' });
+    }
+    // Password / MPIN changed (or reset by the owner) after this token was made → sign in again.
+    if (user.pwd_changed_at) {
+      const changed = Math.floor(Date.parse(user.pwd_changed_at) / 1000);
+      if (Number.isFinite(changed) && payload.iat < changed) {
+        return res.status(401).json({ error: 'Your password or MPIN was changed. Please sign in again.' });
+      }
     }
 
     // Superadmin bypasses all account/plan enforcement
