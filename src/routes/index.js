@@ -21,15 +21,26 @@ const daily      = require('../controllers/dailyReportsController');
 const docs       = require('../controllers/documentsController');
 const registers  = require('../controllers/registersController');
 const summary    = require('../controllers/summaryController');
+const access     = require('../controllers/accessController');
+const account    = require('../controllers/accountController');
+const share      = require('../controllers/shareController');
 const { can }    = require('../middleware/permissions');
+const { safeEqual } = require('../util/security');
+
+// Async handlers: send any error to the error handler instead of leaving the request hanging.
+const aw = (fn) => (req, res, next) => { try { Promise.resolve(fn(req, res, next)).catch(next); } catch (e) { next(e); } };
 
 // ── Auth ──────────────────────────────────────────────────
 router.post('/auth/login',           auth.login);
 router.post('/auth/register',        auth.register);
-router.post('/auth/forgot-password', auth.forgotPassword);
+router.post('/auth/forgot-password', aw(auth.forgotPassword));
 router.post('/auth/reset-password',  auth.resetPassword);
 router.get ('/auth/me',              authenticate, auth.me);
 router.post('/auth/change-password', authenticate, auth.changePassword);
+// Staff: mobile + login code → set MPIN; change MPIN
+router.post('/auth/staff/request-code', aw(access.requestCode));
+router.post('/auth/staff/set-mpin',     access.setMpin);
+router.post('/auth/change-mpin',        authenticate, access.changeMpin);
 
 // ── Super-admin ───────────────────────────────────────────
 router.get  ('/admin/stats',                  authenticate, requireSuperAdmin, admin.adminStats);
@@ -101,6 +112,10 @@ router.get   ('/reports/monthly',    authenticate, sameProperty, can('reports_fi
 router.get   ('/reports/export',     authenticate, sameProperty, can('reports_finance'), finance.reportExport);
 router.get   ('/audit',              authenticate, sameProperty, can('audit'), finance.getAuditLog);
 
+// ── My Account: how guests pay (UPI QR + bank) ───────────
+router.get  ('/account/payment', authenticate, sameProperty, can('settings'), account.getPayment);
+router.patch('/account/payment', authenticate, sameProperty, can('settings'), account.updatePayment);
+
 // ── Property Settings ─────────────────────────────────────
 router.get  ('/properties/profile',  authenticate, sameProperty, finance.getPropertyProfile);
 router.get  ('/properties/settings', authenticate, sameProperty, can('settings'), finance.getPropertySettings);
@@ -108,7 +123,8 @@ router.patch('/properties/settings', authenticate, sameProperty, can('settings')
 
 // ── Staff ─────────────────────────────────────────────────
 router.get   ('/staff',    authenticate, sameProperty, can('staff'), staff.listStaff);
-router.post  ('/staff',    authenticate, sameProperty, can('staff'), staff.inviteStaff);
+router.post  ('/staff',    authenticate, sameProperty, can('staff'), aw(staff.inviteStaff));
+router.post  ('/staff/:id/login-code', authenticate, sameProperty, can('staff'), aw(access.ownerLoginCode));
 router.patch ('/staff/:id',authenticate, sameProperty, can('staff'), staff.updateStaff);
 router.delete('/staff/:id',authenticate, sameProperty, can('staff'), staff.deactivateStaff);
 
@@ -134,6 +150,7 @@ router.get ('/reports/daily/movements', authenticate, sameProperty, can('reports
 router.get ('/reports/daily/cash-book', authenticate, sameProperty, can('cash_close', 'reports_daily'), daily.cashBook);
 router.get ('/reports/daily/dues',      authenticate, sameProperty, can('reports_finance'), daily.dues);
 router.get ('/residents/:id/bill',      authenticate, sameProperty, can('payments', 'reports_finance', 'checkout'), assertOwnsResource('residents'), summary.guestBill);
+router.post('/residents/:id/bill-link', authenticate, sameProperty, can('payments', 'reports_finance', 'checkout'), assertOwnsResource('residents'), share.createBillLink);
 router.get ('/residents/:id/statement', authenticate, sameProperty, can('payments', 'reports_finance'), assertOwnsResource('residents'), daily.residentStatement);
 router.post('/residents/:id/discount',  authenticate, sameProperty, can('discounts'), assertOwnsResource('residents'), daily.addWaiver);
 router.post('/ledger/entries/:id/reverse', authenticate, sameProperty, requireRole('owner'),  daily.reverseEntry);
@@ -167,7 +184,7 @@ function verifyCronSecret(req, res, next) {
     }
     return res.status(401).json({ error: 'Cron endpoint requires CRON_SECRET to be configured' });
   }
-  if (req.headers['x-cron-secret'] !== secret) {
+  if (!safeEqual(req.headers['x-cron-secret'], secret)) {
     return res.status(401).json({ error: 'Invalid cron secret' });
   }
   next();
@@ -181,7 +198,7 @@ function verifyWebhookSecret(req, res, next) {
     }
     return res.status(401).json({ error: 'Webhook endpoint requires WEBHOOK_SECRET to be configured' });
   }
-  if (req.headers['x-webhook-secret'] !== secret) {
+  if (!safeEqual(req.headers['x-webhook-secret'], secret)) {
     return res.status(401).json({ error: 'Invalid webhook secret' });
   }
   next();
