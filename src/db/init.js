@@ -142,6 +142,39 @@ function runMigrations(db) {
     }
   }
 
+  // Staff sign-in with mobile + MPIN, login lockout, sessions ended on password change,
+  // owner's bank / UPI details for bills. All additive: existing rows keep working as before.
+  const accessCols = {
+    users: [['mpin_hash', 'TEXT'], ['mpin_set_at', 'TEXT'], ['pwd_changed_at', 'TEXT'],
+      ['failed_logins', 'INTEGER NOT NULL DEFAULT 0'], ['locked_until', 'TEXT']],
+    otp_store: [['attempts', 'INTEGER NOT NULL DEFAULT 0']],
+    properties: [['upi_id', 'TEXT'], ['upi_name', 'TEXT'], ['upi_uri', 'TEXT'], ['bank_holder', 'TEXT'], ['bank_name', 'TEXT'],
+      ['bank_account_enc', 'TEXT'], ['bank_account_last4', 'TEXT'], ['bank_ifsc', 'TEXT'], ['bank_branch', 'TEXT'],
+      ['show_pay_on_bill', 'INTEGER NOT NULL DEFAULT 1']],
+  };
+  for (const [table, list] of Object.entries(accessCols)) {
+    const have = getColumns(table);
+    if (!have.length) continue;
+    for (const [col, type] of list) {
+      if (!have.includes(col)) {
+        db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`);
+        console.log(`[MIGRATION] Added ${table}.${col}`);
+      }
+    }
+  }
+  // One-time login codes (6 digits, stored hashed). No FKs: a code row can never block anything.
+  db.exec(`CREATE TABLE IF NOT EXISTS login_codes (
+    id TEXT PRIMARY KEY, user_id TEXT NOT NULL, code_hash TEXT NOT NULL, purpose TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0, expires_at TEXT NOT NULL, used_at TEXT, created_by TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')))`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_login_codes_user ON login_codes(user_id, created_at)');
+  // Private bill links sent to guests on WhatsApp (only a hash of the link is stored).
+  db.exec(`CREATE TABLE IF NOT EXISTS bill_links (
+    id TEXT PRIMARY KEY, property_id TEXT NOT NULL, resident_id TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE,
+    created_by TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')), expires_at TEXT NOT NULL,
+    revoked_at TEXT, views INTEGER NOT NULL DEFAULT 0, last_viewed_at TEXT)`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_bill_links_resident ON bill_links(resident_id)');
+
   // Ledger + reports (additive, idempotent). Loaded lazily so a problem in the
   // ledger can never stop the rest of the app from booting.
   try {
