@@ -7,7 +7,7 @@
  * IMPORTANT: Bump CACHE_VERSION on every deploy that changes static files.
  */
 
-const CACHE_VERSION   = 'dormbook-v4.4';
+const CACHE_VERSION   = 'dormbook-v4.5';
 const STATIC_CACHE    = `${CACHE_VERSION}-static`;
 
 const STATIC_ASSETS = [
