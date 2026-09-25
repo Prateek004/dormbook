@@ -343,6 +343,11 @@ function today(req, res) {
   const yesterdayOpen = !cash.is_closed && (cash.cash_in_paise !== 0 || cash.cash_out_paise !== 0);
   const collectedToday = db.prepare(`SELECT COALESCE(SUM(amount_paise),0) t FROM ledger_entries
     WHERE property_id = ? AND biz_date = ? AND kind IN ('PAYMENT','DEPOSIT_IN')`).get(pid, d).t;
+  const collectedCash = db.prepare(`SELECT COALESCE(SUM(amount_paise),0) t FROM ledger_entries
+    WHERE property_id = ? AND biz_date = ? AND kind IN ('PAYMENT','DEPOSIT_IN') AND mode = 'cash'`).get(pid, d).t;
+  // Guests who left today — so their bill is one tap away after check-out.
+  const leftToday = db.prepare(`SELECT r.id, r.full_name, r.mobile, b.bed_label bed FROM residents r LEFT JOIN beds b ON b.id = r.bed_id
+    WHERE r.property_id = ? AND r.status = 'checked_out' AND r.actual_checkout = ? ORDER BY r.updated_at DESC LIMIT 20`).all(pid, d);
 
   let duesList = [], duesTotal = 0;
   if (money) {
@@ -365,6 +370,9 @@ function today(req, res) {
     beds: { total: beds.total || 0, occupied: beds.occupied || 0, available: beds.available || 0,
       cleaning: beds.cleaning || 0, reserved: beds.reserved || 0 },
     collected_today_paise: money ? collectedToday : undefined,
+    collected_today_cash_paise: money ? collectedCash : undefined,
+    collected_today_online_paise: money ? collectedToday - collectedCash : undefined,
+    left_today: leftToday,
     tasks: {
       collect_dues: money ? { count: duesList.length, total_paise: duesTotal, items: duesList.slice(0, 8) } : null,
       leaving_today: { count: leavingToday.length, items: leavingToday },
