@@ -11,6 +11,7 @@ const { SQL } = require('../services/ledger');
 const { istDate, istMonth, addDays, daysBetween } = require('../util/time');
 const { idDisplay } = require('../util/idproof');
 const { company, billNo, cleanReason } = require('./registersController');
+const { payInfo } = require('./accountController');
 
 const MODE = { cash: 'Cash', upi: 'UPI', card: 'Card', bank_transfer: 'Bank transfer' };
 const CAT = { rent: 'Room rent', addon: 'Items', damage: 'Damages', other: 'Other charges', food: 'Food', electricity: 'Electricity' };
@@ -24,11 +25,19 @@ function fmtD(d) {
 
 /** GET /api/v1/residents/:id/bill */
 function guestBill(req, res) {
-  const db = getDb();
-  const pid = req.user.property_id;
+  const bill = buildBill(getDb(), req.user.property_id, req.params.id);
+  if (!bill) return res.status(404).json({ error: 'Guest not found' });
+  return res.json(bill);
+}
+
+/**
+ * The bill for one guest, from the money ledger. Used by the app and by the
+ * private link sent to the guest. Returns null if the guest is not in this property.
+ */
+function buildBill(db, pid, residentId) {
   const r = db.prepare(`SELECT r.rowid rno, r.*, b.bed_label FROM residents r LEFT JOIN beds b ON b.id = r.bed_id
-    WHERE r.id = ? AND r.property_id = ?`).get(req.params.id, pid);
-  if (!r) return res.status(404).json({ error: 'Guest not found' });
+    WHERE r.id = ? AND r.property_id = ?`).get(residentId, pid);
+  if (!r) return null;
 
   const rows = db.prepare(`SELECT * FROM ledger_entries WHERE resident_id = ? AND property_id = ? ORDER BY ref_date, created_at, rowid`)
     .all(r.id, pid);
@@ -62,10 +71,14 @@ function guestBill(req, res) {
   const depBack = live.filter((e) => e.kind === 'DEPOSIT_REFUND').reduce((a, e) => a + e.amount_paise, 0);
 
   const co = company(db, pid);
-  return res.json({
+  const no = billNo(r.rno);
+  let pay = null;
+  try { pay = payInfo(db, pid, { amountPaise: Math.max(0, bal.dues), note: `Bill ${no}` }); }
+  catch (e) { console.error('[BILL] payment QR failed:', e.message); }   // a QR problem must never hide the bill
+  return {
     company: co,
     title: co.gstin && gst > 0 ? 'Tax Invoice' : 'Bill',
-    bill_no: billNo(r.rno), date: istDate(),
+    bill_no: no, date: istDate(),
     guest: {
       name: r.full_name, mobile: r.mobile, bed: r.bed_label || '—', check_in: r.check_in_date,
       check_out: r.actual_checkout || r.expected_checkout, status: r.status === 'active' ? 'Staying' : 'Left',
@@ -78,7 +91,8 @@ function guestBill(req, res) {
     discounts, discount: sum(discounts, 'amount'),
     deposit: { received: depIn, adjusted: depUsed, refunded: depBack, held: bal.deposit },
     balance: bal.dues,   // > 0 = guest owes, < 0 = advance with us
-  });
+    pay,                 // UPI QR + bank details for the end of the bill (null if not set up)
+  };
 }
 
 /** GET /api/v1/reports/monthly?month=YYYY-MM */
@@ -111,6 +125,9 @@ function monthly(req, res) {
   const duesNow = one(`SELECT COALESCE(SUM(d),0) t FROM (SELECT ${SQL.dues} d FROM ledger_entries WHERE property_id = ?
     AND biz_date <= ? GROUP BY resident_id) WHERE d > 0`, pid, to).t;
 
+  const byMode = one(`SELECT COALESCE(SUM(CASE WHEN mode='cash' THEN amount_paise END),0) cash,
+      COALESCE(SUM(CASE WHEN mode<>'cash' THEN amount_paise END),0) online
+    FROM ledger_entries WHERE property_id = ? AND kind IN ('PAYMENT','DEPOSIT_IN') AND biz_date BETWEEN ? AND ?`, pid, from, to);
   const totalReceived = received.reduce((a, r) => a + r.amount, 0) - creditRefunds;
   const totalExpenses = expenses.reduce((a, r) => a + r.amount, 0);
   const totalBilled = billed.reduce((a, r) => a + r.amount, 0);
@@ -149,6 +166,7 @@ function monthly(req, res) {
       billed: totalBilled, gst_billed: gstBilled, discount, dues_outstanding: duesNow,
       occupancy_pct: occupancy, beds: totalBeds, check_ins: checkIns, check_outs: checkOuts,
       deposits_received: depIn, deposits_refunded: depOut,
+      cash_in: byMode.cash, online_in: byMode.online,   // money in (payments + deposits) by how it was paid
     },
     income: received.map((r) => ({ head: CAT[r.head] || r.head, amount: r.amount }))
       .concat(creditRefunds ? [{ head: 'Advance refunded', amount: -creditRefunds }] : []),
@@ -159,4 +177,4 @@ function monthly(req, res) {
   });
 }
 
-module.exports = { guestBill, monthly };
+module.exports = { guestBill, monthly, buildBill };
