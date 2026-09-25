@@ -22,6 +22,9 @@ const ENV  = process.env.NODE_ENV || 'development';
 // the proxy's — without it every user would share one IP and be rate-limited
 // together.
 app.set('trust proxy', 1);
+// Query strings are parsed simply (no nested objects/arrays): nothing in the app needs more,
+// and it closes the known "qs" denial-of-service holes.
+app.set('query parser', 'simple');
 
 // A crash-proof server must survive stray async errors instead of exiting.
 // Log loudly and keep serving; a single bad request should never take the
@@ -46,15 +49,22 @@ app.use(helmet({
   },
 }));
 
-app.use(cors());
+// The app and its API are on the same site, so other websites get no CORS access.
+// (To allow a separate front-end later, set CORS_ORIGINS=https://a.com,https://b.com)
+const corsOrigins = String(process.env.CORS_ORIGINS || '').split(',').map((x) => x.trim()).filter(Boolean);
+app.use(cors({ origin: corsOrigins.length ? corsOrigins : false }));
+app.use((req, res, next) => {
+  res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), payment=()');
+  next();
+});
 app.use(express.json({ limit: '3mb' })); // ID photos arrive as base64 (max 1.5 MB file)
 app.use(morgan(ENV === 'production' ? 'combined' : 'dev'));
 
-// Brute-force protection on credential endpoints. 20 attempts / 15 min / IP.
-// Successful logins are cheap; this only bites password-guessing loops.
+// Brute-force protection on credential endpoints: 40 attempts / 15 min / IP (all staff on one
+// Wi-Fi share an IP). Each account is also locked for 15 minutes after 5 wrong tries.
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 20,
+  max: 40,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many attempts. Please try again in a few minutes.' },
@@ -63,9 +73,26 @@ app.use('/api/v1/auth/login',           authLimiter);
 app.use('/api/v1/auth/register',        authLimiter);
 app.use('/api/v1/auth/forgot-password', authLimiter);
 app.use('/api/v1/auth/reset-password',  authLimiter);
+app.use('/api/v1/auth/staff',           authLimiter);   // login code + MPIN set up
+app.use('/api/v1/auth/change-password', authLimiter);
+app.use('/api/v1/auth/change-mpin',     authLimiter);
+
+// Whole API: a very high ceiling that normal use never reaches (a whole hostel on one Wi-Fi
+// shares one IP), but stops a runaway script from flooding the server.
+app.use('/api/', rateLimit({
+  windowMs: 60 * 1000, max: 600, standardHeaders: true, legacyHeaders: false,
+  message: { error: 'Too many requests. Please wait a minute.' },
+}));
+
+// Guest bill links (no sign-in): limited so links can't be guessed by brute force.
+const share = require('./controllers/shareController');
+app.get('/b/:token', rateLimit({ windowMs: 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false,
+  message: 'Too many requests. Please wait a minute.' }), share.viewBill);
 
 app.use(express.static(path.join(__dirname, '..', 'public')));
 app.use('/api/v1', routes);
+// Unknown API paths answer JSON 404 (not the app's HTML page).
+app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));
 
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
