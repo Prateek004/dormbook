@@ -1,9 +1,13 @@
 'use strict';
 
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const { getDb }       = require('../db/connection');
 const { writeAudit }  = require('../middleware/auditLog');
+const { mobile10 } = require('../util/security');
+const sms = require('../services/smsService');
+const { issueLoginCode } = require('./accessController');
 const { PERMISSIONS, ROLE_DEFAULTS, effectivePermissions, sanitizePermissions } = require('../middleware/permissions');
 
 /** You can only hand out permissions you have yourself (no privilege escalation). */
@@ -20,16 +24,18 @@ const BCRYPT_ROUNDS = parseInt(process.env.BCRYPT_ROUNDS || '12', 10);
 function listStaff(req, res) {
   const db = getDb();
   const staff = db.prepare(`
-    SELECT id, name, email, mobile, role, is_active, created_at, permissions
-    FROM users WHERE property_id = ? ORDER BY role, name
+    SELECT * FROM users WHERE property_id = ? ORDER BY role, name
   `).all(req.user.property_id).map((u) => ({
-    ...u, permissions: effectivePermissions(u), custom_permissions: !!u.permissions && u.role !== 'owner',
+    id: u.id, name: u.name, email: u.email, mobile: u.mobile, role: u.role, is_active: u.is_active, created_at: u.created_at,
+    permissions: effectivePermissions(u), custom_permissions: !!u.permissions && u.role !== 'owner',
+    has_mpin: !!u.mpin_hash,
+    locked: !!(u.locked_until && u.locked_until > new Date().toISOString()),
   }));
   return res.json({ staff, all_permissions: PERMISSIONS, role_defaults: ROLE_DEFAULTS });
 }
 
-/** POST /api/v1/staff */
-function inviteStaff(req, res) {
+/** POST /api/v1/staff — password is optional: without one the user gets a login code and sets an MPIN. */
+async function inviteStaff(req, res) {
   const db = getDb();
   const propertyId = req.user.property_id;
   const accountId  = req.user.account_id;  // inherit from the inviting owner
@@ -38,18 +44,23 @@ function inviteStaff(req, res) {
   const grantErr = checkGrantable(req, perms);
   if (grantErr) return res.status(403).json({ error: grantErr });
 
-  if (!name || !mobile || !role || !password) {
-    return res.status(400).json({ error: 'name, mobile, role, and password are required' });
+  if (!name || !mobile || !role) {
+    return res.status(400).json({ error: 'name, mobile and role are required' });
   }
+  if (typeof name !== 'string' || String(name).trim().length > 120) return res.status(400).json({ error: 'Name is too long' });
   const VALID_ROLES = ['manager', 'reception'];
   if (!VALID_ROLES.includes(role)) {
     return res.status(400).json({ error: `role must be one of: ${VALID_ROLES.join(', ')}` });
   }
-  if (password.length < 8) {
+  const hasPassword = password !== undefined && password !== null && password !== '';
+  if (hasPassword && (String(password).length < 8 || String(password).length > 200)) {
     return res.status(400).json({ error: 'password must be at least 8 characters' });
   }
-  const mobileClean = String(mobile).replace(/\D/g, '');
-  if (mobileClean.length < 10) return res.status(400).json({ error: 'Invalid mobile number' });
+  const mobileClean = mobile10(mobile);
+  if (!mobileClean) return res.status(400).json({ error: 'Type a 10-digit mobile number' });
+  if (email && (typeof email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()) || email.length > 120)) {
+    return res.status(400).json({ error: 'Email is not valid' });
+  }
 
   // Check uniqueness for mobile (system-wide) and email (if provided)
   const existingMobile = db.prepare('SELECT id FROM users WHERE mobile = ?').get(mobileClean);
@@ -68,7 +79,8 @@ function inviteStaff(req, res) {
   `).run(
     id, accountId, propertyId, String(name).trim(),
     email ? String(email).toLowerCase().trim() : null,
-    mobileClean, bcrypt.hashSync(String(password), BCRYPT_ROUNDS),
+    // No password → an unguessable one nobody knows; the user signs in with MPIN.
+    mobileClean, bcrypt.hashSync(hasPassword ? String(password) : crypto.randomBytes(32).toString('hex'), BCRYPT_ROUNDS),
     role, now, now, perms ? JSON.stringify(perms) : null
   );
 
@@ -79,9 +91,17 @@ function inviteStaff(req, res) {
     ip: req.ip,
   });
 
+  let login_code = null;
+  if (!hasPassword) {
+    const created = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+    login_code = issueLoginCode(db, created, { createdBy: req.user.id, purpose: 'owner' });
+    login_code.sms_sent = await sms.sendLoginCode(mobileClean, login_code.code);
+  }
+
   return res.status(201).json({
     id, name, email: email || null, mobile: mobileClean, role, is_active: 1,
     permissions: effectivePermissions({ role, permissions: perms ? JSON.stringify(perms) : null }),
+    login_code,
   });
 }
 
@@ -99,7 +119,7 @@ function updateStaff(req, res) {
   if (!user) return res.status(404).json({ error: 'Staff member not found' });
   if (user.role === 'owner') return res.status(403).json({ error: 'Cannot modify owner account' });
   if (user.id === req.user.id && (perms || resetPerms)) return res.status(403).json({ error: 'You cannot change your own permissions' });
-  if (new_password !== undefined && String(new_password).length < 8) {
+  if (new_password !== undefined && (String(new_password).length < 8 || String(new_password).length > 200)) {
     return res.status(400).json({ error: 'New password must be at least 8 characters' });
   }
 
@@ -118,8 +138,11 @@ function updateStaff(req, res) {
     db.prepare('UPDATE users SET permissions = ? WHERE id = ?').run(perms ? JSON.stringify(perms) : null, req.params.id);
   }
   if (new_password !== undefined) {
-    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(String(new_password), BCRYPT_ROUNDS), req.params.id);
+    // New password from the owner: that user's other sessions end.
+    db.prepare('UPDATE users SET password_hash = ?, pwd_changed_at = ?, failed_logins = 0, locked_until = NULL WHERE id = ?')
+      .run(bcrypt.hashSync(String(new_password), BCRYPT_ROUNDS), new Date().toISOString(), req.params.id);
   }
+  if (req.body.unlock) db.prepare('UPDATE users SET failed_logins = 0, locked_until = NULL WHERE id = ?').run(req.params.id);
 
   writeAudit({
     propertyId, userId: req.user.id, action: 'STAFF_UPDATED',
@@ -142,7 +165,8 @@ function deactivateStaff(req, res) {
   if (user.role === 'owner') return res.status(403).json({ error: 'Cannot deactivate owner account' });
   if (user.id === req.user.id) return res.status(403).json({ error: 'Cannot deactivate your own account' });
 
-  db.prepare("UPDATE users SET is_active=0, updated_at=datetime('now') WHERE id=?").run(req.params.id);
+  // Blocked: signed out everywhere at once (is_active is checked on every request too).
+  db.prepare("UPDATE users SET is_active=0, pwd_changed_at=?, updated_at=datetime('now') WHERE id=?").run(new Date().toISOString(), req.params.id);
   writeAudit({
     propertyId, userId: req.user.id, action: 'STAFF_DEACTIVATED',
     entityType: 'users', entityId: req.params.id,
