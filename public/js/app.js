@@ -69,7 +69,13 @@ function todayIST() { return new Date(Date.now() + 330 * 60000).toISOString().sl
 function h(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c])); }
 function rupees(paise) { const v = Math.round(paise || 0); const t = `₹${(Math.abs(v) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`; return v < 0 ? `−${t}` : t; }
 function fmtDate(d) { return d ? new Date(d).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : '—'; }
-function esc(s) { return String(s || '').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'&quot;'); }
+// For text inside onclick="fn('…')": escaped for JavaScript first, then for HTML, so a name like
+// x&#39;);alert(1)// stays plain text. (The old version missed "&" and could run such a name as code.)
+function esc(s) {
+  const js = String(s ?? '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '\\"')
+    .replace(/\r/g, '\\r').replace(/\n/g, '\\n').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029').replace(/</g, '\\x3c');
+  return h(js);
+}
 
 // ── Toast ────────────────────────────────────────────────────
 function toast(msg, type = 'info', duration = 3500) {
@@ -181,6 +187,7 @@ const NAV = [
     { id: 'settings',  label: '🏢 Business & GST',  perms: ['settings'] },
     { id: 'staff',     label: '👤 Users & Access',  perms: ['staff'] },
     { id: 'audit',     label: '🔍 Audit Log',       perms: ['audit'] },
+    { id: 'account',   label: '🔑 My Account' },
   ] },
 ];
 const PAGES = NAV.flatMap(g => g.items);
@@ -235,7 +242,7 @@ function titleFor(page) {
   const map = { dashboard: 'Today', checkin: 'Check In', residents: 'Guests', payments: 'Take Payment', bookings: 'Bookings',
     expenses: 'Expenses', reconcile: 'Cash Close', summary: 'Monthly Summary', reports: 'Registers', gst: 'GST Report',
     daily: 'Daily View', beds: 'Beds', catalog: 'Items & Prices', settings: 'Business & GST', staff: 'Users & Access',
-    audit: 'Audit Log', feedback: 'Tenant Feedback', admin: 'Admin Panel' };
+    audit: 'Audit Log', feedback: 'Tenant Feedback', admin: 'Admin Panel', account: 'My Account' };
   return map[page] || page;
 }
 
@@ -245,7 +252,7 @@ function closeSidebar() { document.getElementById('sidebar').classList.remove('o
 
 // ── Screen helper ────────────────────────────────────────────
 function showScreen(id) {
-  ['login-screen', 'register-screen', 'forgot-screen', 'main-app', 'loading-screen'].forEach(s => {
+  ['login-screen', 'register-screen', 'forgot-screen', 'mpin-screen', 'main-app', 'loading-screen'].forEach(s => {
     const el = document.getElementById(s);
     if (el) el.classList.add('hidden');
   });
@@ -309,6 +316,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Forgot password — step 2 (reset with OTP)
   document.getElementById('forgot-reset-btn')?.addEventListener('click', handleForgotReset);
+
+  // Staff: first time / forgot MPIN
+  document.getElementById('goto-mpin')?.addEventListener('click', e => { e.preventDefault(); showMpinScreen(); });
+  document.getElementById('goto-login-3')?.addEventListener('click', e => { e.preventDefault(); showScreen('login-screen'); });
+  document.getElementById('mp-save')?.addEventListener('click', submitMpinSetup);
+  document.getElementById('mp-sms')?.addEventListener('click', e => { e.preventDefault(); requestMpinCode(); });
+  document.getElementById('mpin-form')?.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); submitMpinSetup(); } });
 });
 
 async function handleLogin(e) {
@@ -323,11 +337,8 @@ async function handleLogin(e) {
       email:    document.getElementById('login-email').value.trim(),
       password: document.getElementById('login-password').value,
     });
-    STATE.token = data.token;
-    STATE.user  = data.user;
-    sessionStorage.setItem('db_token', data.token);
-    sessionStorage.setItem('db_user',  JSON.stringify(data.user));
-    showApp();
+    document.getElementById('login-password').value = '';
+    startSession(data);
   } catch (ex) {
     const msg = ex.status === 0
       ? 'Cannot reach server. Check your connection.'
@@ -423,7 +434,7 @@ async function handleForgotReset(e) {
 
 function showApp() {
   showScreen('main-app');
-  document.getElementById('user-badge').textContent = `${h(STATE.user.name)} · ${STATE.user.role}`;
+  document.getElementById('user-badge').textContent = `${STATE.user.name} · ${STATE.user.role}`;
   // Remove old listeners before adding (guard against double-attach after login → logout → login)
   const logoutBtn = document.getElementById('logout-btn');
   const newLogout = logoutBtn.cloneNode(true);
@@ -496,6 +507,7 @@ async function renderPage(page) {
       case 'catalog':   await renderCatalog(el);   break;
       case 'audit':     await renderAudit(el);     break;
       case 'settings':  await renderSettings(el);  break;
+      case 'account':   await renderAccount(el);   break;
       case 'admin':     await renderAdminPanel(el); break;
       default:          el.innerHTML = '<div class="empty-state"><p>Page not found</p></div>';
     }
@@ -523,7 +535,7 @@ async function renderDashboard(el) {
     <div class="kpis">
       <div class="kpi"><span>Occupancy</span><strong>${occ}%</strong><em>${b.occupied} of ${b.total} beds</em></div>
       <div class="kpi"><span>Vacant beds</span><strong>${b.available}</strong><em>${b.reserved} on hold · ${b.cleaning} cleaning</em></div>
-      ${d.collected_today_paise !== undefined ? `<div class="kpi"><span>Collected today</span><strong>${rupees(d.collected_today_paise)}</strong><em>cash, UPI and card</em></div>` : ''}
+      ${d.collected_today_paise !== undefined ? `<div class="kpi"><span>Collected today</span><strong>${rupees(d.collected_today_paise)}</strong><em>${d.collected_today_cash_paise !== undefined ? `Cash ${rupees(d.collected_today_cash_paise)} · Online ${rupees(d.collected_today_online_paise)}` : 'cash, UPI and card'}</em></div>` : ''}
       ${t.collect_dues ? `<div class="kpi ${t.collect_dues.total_paise ? 'bad' : ''}"><span>Dues pending</span><strong>${rupees(t.collect_dues.total_paise)}</strong><em>${t.collect_dues.count} residents</em></div>` : ''}
     </div>
 
@@ -546,6 +558,8 @@ async function renderDashboard(el) {
         row(`${h(r.full_name)} · ${rupees(r.dues_paise)}`, `${h(r.bed || (r.status === 'checked_out' ? 'left' : ''))} · ${r.days_overdue} days overdue`,
           can('payments') ? `<button class="btn btn-primary btn-sm" onclick="showPaymentModal('${r.id}','${esc(r.full_name)}')">Collect</button>` : '')).join('')
           + (t.collect_dues.count > t.collect_dues.items.length ? `<div class="td-small mt-12">+ ${t.collect_dues.count - t.collect_dues.items.length} more in Reports → Outstanding Dues</div>` : ''), 'bad') : ''}
+      ${(d.left_today || []).length && (can('payments') || can('reports_finance') || can('checkout')) ? task('🧾', 'Left today — bills', d.left_today.length, d.left_today.map(r =>
+        row(`${h(r.full_name)} · ${h(r.bed || '')}`, h(r.mobile), `<button class="btn btn-outline btn-sm" onclick="showBill('${r.id}')">🧾 Bill</button>`)).join('')) : ''}
       ${task('⏰', 'Overstaying', t.overstaying.count, t.overstaying.items.map(r =>
         row(`${h(r.full_name)} · ${h(r.bed || '')}`, `was due ${fmtDate(r.expected_checkout)}`,
           can('checkout') ? `<button class="btn btn-outline btn-sm" onclick="showCheckoutModal('${r.id}','${esc(r.full_name)}')">Check out</button>` : '')).join(''), 'warn')}
@@ -1108,11 +1122,13 @@ async function renderResidents(el) {
   const ha = document.getElementById('header-actions');
   ha.innerHTML = `
     <input id="res-search" class="hdr-input" placeholder="Search name, mobile or bed…" />
-    <select id="res-status" class="hdr-input"><option value="active">Staying</option><option value="checked_out">Left</option><option value="all">All</option></select>`;
+    <select id="res-status" class="hdr-input" aria-label="Show"><option value="active">Staying now</option><option value="checked_out">Left (past guests)</option><option value="all">All guests</option></select>`;
+  if (STATE.resStatus) document.getElementById('res-status').value = STATE.resStatus;
 
   async function load() {
     const search = document.getElementById('res-search')?.value.trim().toLowerCase() || '';
     const status = document.getElementById('res-status')?.value || 'active';
+    STATE.resStatus = status;
     const all = await api('GET', `/residents?status=${status}`);
     const residents = search ? all.filter(r => [r.full_name, r.mobile, r.bed_label].some(v => String(v || '').toLowerCase().includes(search))) : all;
     const today = todayIST();
@@ -1127,7 +1143,7 @@ async function renderResidents(el) {
               return `<tr>
                 <td><a href="#" class="td-name" onclick="event.preventDefault();showResidentDetail('${r.id}')">${h(r.full_name)}</a><div class="td-small">${h(r.mobile)}</div></td>
                 <td><b>${h(r.bed_label || '—')}</b></td>
-                <td>${fmtDate(r.check_in_date)} → <span class="${late ? 'text-danger' : ''}">${fmtDate(out)}</span>${late ? '<div class="td-small text-danger">overstaying</div>' : ''}</td>
+                <td>${fmtDate(r.check_in_date)} → <span class="${late ? 'text-danger' : ''}">${fmtDate(out)}</span>${late ? '<div class="td-small text-danger">overstaying</div>' : ''}${r.status !== 'active' ? '<div class="td-small">left</div>' : ''}</td>
                 <td class="num">${r.pending_rent_paise > 0 ? `<span class="text-danger fw-bold">${rupees(r.pending_rent_paise)}</span>` : r.advance_credit_paise > 0 ? `<span class="text-success">${rupees(r.advance_credit_paise)} adv</span>` : '<span class="text-success">Paid</span>'}</td>
                 <td class="actions">
                   ${r.status === 'active' && can('addons') ? `<button class="btn btn-outline btn-sm" title="Add tea, coffee, laundry… to the bill" onclick="showAddItemModal('${r.id}','${esc(r.full_name)}')">☕ Item</button>` : ''}
@@ -1138,7 +1154,8 @@ async function renderResidents(el) {
             }).join('')}
           </tbody>
         </table>
-      </div>` : `<div class="empty-state"><div class="empty-icon">👥</div><p>No residents found</p></div>`;
+      </div>` : `<div class="empty-state"><div class="empty-icon">👥</div><p>${status === 'active' && !search ? 'Nobody is staying now.' : 'No guests found'}</p>
+      ${status === 'active' ? `<button class="btn btn-outline btn-sm mt-12" onclick="STATE.resStatus='checked_out';renderPage('residents')">See past guests</button>` : ''}</div>`;
   }
   await load();
   document.getElementById('res-search').addEventListener('input', () => { clearTimeout(window._rsTimer); window._rsTimer = setTimeout(load, 250); });
@@ -1271,6 +1288,8 @@ async function submitCheckout(id) {
     toast(res.refund_pending_approval ? 'Check-out sent for owner approval' : 'Checked out. Bed marked for cleaning.',
       res.refund_pending_approval ? 'warning' : 'success', 5000);
     closeModal(); refreshCurrentPage();
+    // Show the final bill right away: print it or send it on WhatsApp. It stays in Guests → Left.
+    showBill(id, { justCheckedOut: !res.refund_pending_approval });
   } catch (ex) { err.textContent = ex.message; err.classList.remove('hidden'); btn.disabled = false; }
 }
 
@@ -1811,13 +1830,18 @@ function setReportRange(page, which) {
 }
 
 /** The same letterhead block used by reports, the monthly summary and bills. */
-function letterhead(c, title, sub) {
+function letterhead(c, title, sub, opts = {}) {
+  // Bills lead with the dormitory name (what the guest knows); reports lead with the company.
+  const dorm = opts.dormFirst && c.property_name;
+  const main = dorm ? c.property_name : c.business_name;
+  const second = dorm ? (c.business_name && c.business_name !== c.property_name ? `A unit of ${c.business_name}` : '')
+    : (c.property_name && c.property_name !== c.business_name ? c.property_name : '');
   return `
       <header class="letterhead">
         <div>
-          <div class="lh-name">${h(c.business_name)}</div>
-          ${c.property_name && c.property_name !== c.business_name ? `<div class="lh-sub">${h(c.property_name)}</div>` : ''}
-          <div class="lh-addr">${h(c.address || 'Add your address in Settings')}</div>
+          <div class="lh-name">${h(main)}</div>
+          ${second ? `<div class="lh-sub">${h(second)}</div>` : ''}
+          ${c.address ? `<div class="lh-addr">${h(c.address)}</div>` : '<div class="lh-addr no-print text-muted">Add your address in Business &amp; GST</div>'}
           <div class="lh-addr">${[c.phone && `Ph: ${h(c.phone)}`, c.email && h(c.email), c.gstin && `GSTIN: ${h(c.gstin)}`].filter(Boolean).join(' · ')}</div>
         </div>
         <div class="lh-right">
@@ -1863,6 +1887,8 @@ async function renderMonthly(el) {
         ${tile('Dues pending', rupees(k.dues_outstanding), 'at month end', k.dues_outstanding ? 'bad' : '')}
         ${tile('Deposits', rupees(k.deposits_received), `refunded ${rupees(k.deposits_refunded)}`)}
         ${tile('Discounts', rupees(k.discount), '')}
+        ${k.cash_in !== undefined ? tile('Received in cash', rupees(k.cash_in), 'rent, items and deposits') : ''}
+        ${k.online_in !== undefined ? tile('Received online', rupees(k.online_in), 'UPI, card and bank') : ''}
       </div>
       <div class="card sum-card mb-20">
         <div class="sum-title">Last 6 months</div>
@@ -1907,7 +1933,7 @@ function trendChart(trend) {
 }
 
 // ── Guest bill / tax invoice ─────────────────────────────────
-async function showBill(residentId) {
+async function showBill(residentId, opts = {}) {
   let b;
   try { b = await api('GET', `/residents/${residentId}/bill`); } catch (ex) { toast(ex.message, 'error'); return; }
   const hasGst = b.totals.gst > 0;
@@ -1918,11 +1944,15 @@ async function showBill(residentId) {
   const g = b.guest;
   const owes = b.balance > 0, adv = b.balance < 0;
   openModal(`${b.title} · ${b.bill_no}`, `
+    ${opts.justCheckedOut ? `<div class="done-banner no-print">✅ ${h(g.name)} is checked out. Print the bill or send it on WhatsApp. You can open it again any time from Guests → Left.</div>` : ''}
+    ${(b.company.missing || []).length && can('settings') ? `<div class="warn-banner no-print">Your ${b.company.missing.join(', ')} ${b.company.missing.length > 1 ? 'are' : 'is'} missing on bills.
+      <a href="#" onclick="event.preventDefault();closeModal();navigate('settings')">Add in Business &amp; GST</a></div>` : ''}
     <div class="btn-group no-print mb-12">
-      <button class="btn btn-primary btn-sm" onclick="printBill()">🖨 Print / Save PDF</button>
+      <button class="btn btn-primary" onclick="printBill()">🖨 Print / Save PDF</button>
+      <button class="btn btn-whatsapp" id="bill-wa" onclick="sendBillWhatsApp('${h(residentId)}')">🟢 Send on WhatsApp</button>
     </div>
     <article class="report-doc bill-doc" id="bill-doc">
-      ${letterhead(b.company, b.title, `No. ${h(b.bill_no)} · ${fmtDate(b.date)}`)}
+      ${letterhead(b.company, b.title, `No. ${h(b.bill_no)} · ${fmtDate(b.date)}`, { dormFirst: true })}
       <div class="bill-to">
         <div><div class="td-small">Bill to</div><b>${h(g.name)}</b><div>${h(g.mobile)}</div>${g.address ? `<div class="td-small">${h(g.address)}</div>` : ''}</div>
         <div><div class="td-small">Stay</div><b>Bed ${h(g.bed)}</b><div>${fmtDate(g.check_in)} → ${fmtDate(g.check_out)}</div>
@@ -1946,6 +1976,7 @@ async function showBill(residentId) {
       </div>
       ${b.payments.length ? `<div class="section-title">Payments</div>
         <table class="report-table compact"><tbody>${b.payments.map(p => `<tr><td>${fmtDate(p.date)}</td><td>${h(p.what)}</td><td>${h(p.mode)}</td><td class="num">${rupees(p.amount)}</td></tr>`).join('')}</tbody></table>` : ''}
+      ${payBlock(b.pay, b.balance, b.company)}
       <footer class="rep-foot">This is a computer-generated ${b.title.toLowerCase()} · DormBook</footer>
     </article>`, { wide: true });
 }
@@ -1997,7 +2028,8 @@ function reportDocument(rep) {
 function downloadReportCsv() {
   const rep = window._report;
   if (!rep) return;
-  const q = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  // Text starting with = + - @ would run as a formula in Excel: put a ' in front (numbers are safe).
+  const q = (v) => { let t = String(v ?? ''); if (typeof v === 'string' && /^[=+\-@\t\r]/.test(t)) t = "'" + t; return `"${t.replace(/"/g, '""')}"`; };
   const plain = (v, t) => v === null || v === undefined ? '' : t === 'money' ? (v / 100).toFixed(2) : v;
   const c = rep.company;
   const lines = [
@@ -2294,7 +2326,7 @@ async function renderStaff(el) {
   el.innerHTML = `
     <div class="card table-wrap">
       <table>
-        <thead><tr><th>User</th><th>Role</th><th>Can do</th><th>Status</th><th></th></tr></thead>
+        <thead><tr><th>User</th><th>Role</th><th>Can do</th><th>Sign-in</th><th></th></tr></thead>
         <tbody>
           ${data.staff.map(u => `
             <tr>
@@ -2302,15 +2334,22 @@ async function renderStaff(el) {
               <td><span class="role-chip role-${u.role}">${u.role === 'reception' ? 'Reception' : u.role === 'manager' ? 'Manager' : 'Owner'}</span>
                 ${u.custom_permissions ? '<div class="td-small">custom access</div>' : ''}</td>
               <td class="perm-list">${u.role === 'owner' ? '<span class="td-small">Everything</span>' : u.permissions.map(p => `<span class="perm">${h(P[p] || p)}</span>`).join('')}</td>
-              <td><span class="badge ${u.is_active ? 'badge-success' : 'badge-gray'}">${u.is_active ? 'Active' : 'Blocked'}</span></td>
+              <td>${!u.is_active ? '<span class="badge badge-gray">Blocked</span>'
+                : u.locked ? '<span class="badge badge-danger">Locked (wrong tries)</span>'
+                : u.role === 'owner' ? '<span class="td-small">Password</span>'
+                : u.has_mpin ? '<span class="badge badge-success">MPIN set</span>'
+                : '<span class="badge badge-warning">Waiting for first sign-in</span>'}</td>
               <td class="actions">${u.role !== 'owner' && u.id !== STATE.user.id ? `
+                ${u.is_active ? `<button class="btn btn-primary btn-sm" onclick="newLoginCode('${u.id}')">🔑 Login code</button>` : ''}
+                ${u.locked ? `<button class="btn btn-outline btn-sm" onclick="unlockStaff('${u.id}')">Unlock</button>` : ''}
                 <button class="btn btn-outline btn-sm" onclick="showUserModal('${u.id}')">Edit</button>
                 <button class="btn btn-outline btn-sm" onclick="toggleStaff('${u.id}', ${u.is_active})">${u.is_active ? 'Block' : 'Unblock'}</button>` : ''}</td>
             </tr>`).join('')}
         </tbody>
       </table>
     </div>
-    <p class="td-small mt-12">Blocked users cannot sign in. Their past entries stay in the records.</p>`;
+    <p class="td-small mt-12">Staff sign in with their mobile number and their own MPIN. First time, or forgot MPIN? Press <b>🔑 Login code</b> and give them the code.
+      Blocked users cannot sign in. Their past entries stay in the records.</p>`;
 }
 
 async function toggleStaff(id, isActive) {
@@ -2331,13 +2370,11 @@ function showUserModal(userId) {
   openModal(u ? `Edit ${u.name}` : 'Add user', `
     ${u ? '' : `
     <div class="field-row">
-      <div class="field"><label for="sf-name">Name *</label><input id="sf-name" /></div>
-      <div class="field"><label for="sf-mobile">Mobile * (used to sign in)</label><input id="sf-mobile" type="tel" /></div>
+      <div class="field"><label for="sf-name">Name *</label><input id="sf-name" maxlength="120" autocomplete="off" /></div>
+      <div class="field"><label for="sf-mobile">Mobile * (used to sign in)</label><input id="sf-mobile" type="tel" inputmode="numeric" maxlength="14" placeholder="10-digit mobile" /></div>
     </div>
-    <div class="field-row">
-      <div class="field"><label for="sf-email">Email</label><input id="sf-email" type="email" /></div>
-      <div class="field"><label for="sf-password">Password *</label><input id="sf-password" type="text" placeholder="Min 8 characters" /></div>
-    </div>`}
+    <div class="field"><label for="sf-email">Email (optional)</label><input id="sf-email" type="email" maxlength="120" /></div>
+    <div class="field-note mb-12">No password needed. After you add them you get a 6-digit login code. They enter it once and set their own MPIN.</div>`}
     <div class="field"><label for="sf-role">Role</label>
       <select id="sf-role"><option value="reception" ${role === 'reception' ? 'selected' : ''}>Reception</option><option value="manager" ${role === 'manager' ? 'selected' : ''}>Manager</option></select>
       <div class="field-note">Choosing a role ticks its usual permissions. You can change any tick below.</div></div>
@@ -2346,7 +2383,7 @@ function showUserModal(userId) {
       ${Object.entries(P).map(([k, label]) => `
         <label class="perm-check ${mine.includes(k) ? '' : 'disabled'}"><input type="checkbox" value="${k}" ${checked.has(k) ? 'checked' : ''} ${mine.includes(k) ? '' : 'disabled'} /> ${h(label)}</label>`).join('')}
     </div>
-    ${u ? `<div class="field mt-12"><label for="sf-newpass">Reset password</label><input id="sf-newpass" type="text" placeholder="Leave empty to keep the current password" /></div>` : ''}
+    ${u ? `<div class="field-note mt-12">Forgot MPIN? Close this and press <b>🔑 Login code</b> for ${h(u.name)}.</div>` : ''}
     <div id="sf-error" class="error-msg hidden"></div>
     <div class="btn-group mt-12">
       <button class="btn btn-primary" onclick="saveUser(${u ? `'${u.id}'` : 'null'})">${u ? 'Save' : 'Add user'}</button>
@@ -2365,20 +2402,20 @@ async function saveUser(userId) {
   const role = document.getElementById('sf-role').value;
   try {
     if (userId) {
-      const body = { role, permissions };
-      const np = document.getElementById('sf-newpass').value;
-      if (np) body.new_password = np;
-      await api('PATCH', `/staff/${userId}`, body);
-      toast(np ? 'Saved. New password set.' : 'Saved', 'success');
+      await api('PATCH', `/staff/${userId}`, { role, permissions });
+      toast('Saved', 'success');
+      closeModal(); renderPage('staff');
     } else {
-      await api('POST', '/staff', {
-        name: document.getElementById('sf-name').value.trim(), mobile: document.getElementById('sf-mobile').value.trim(),
-        email: document.getElementById('sf-email').value.trim() || undefined, password: document.getElementById('sf-password').value,
-        role, permissions,
+      const name = document.getElementById('sf-name').value.trim();
+      const mobile = document.getElementById('sf-mobile').value.replace(/\D/g, '').replace(/^(91|0)(?=\d{10}$)/, '');
+      if (!name) throw new Error('Type the name');
+      if (!/^\d{10}$/.test(mobile)) throw new Error('Type a 10-digit mobile number');
+      const u = await api('POST', '/staff', {
+        name, mobile, email: document.getElementById('sf-email').value.trim() || undefined, role, permissions,
       });
-      toast('User added. They sign in with their mobile number and this password.', 'success', 6000);
+      renderPage('staff');
+      showLoginCode({ ...u.login_code, name: u.name, mobile: u.mobile }, true);
     }
-    closeModal(); renderPage('staff');
   } catch (ex) { err.textContent = ex.message; err.classList.remove('hidden'); }
 }
 
@@ -2622,6 +2659,277 @@ async function adminSuspend(id) {
     toast('Account suspended', 'warning');
     renderPage('admin');
   } catch(ex) { toast(ex.message, 'error'); }
+}
+
+// ── Staff login code (first sign-in / forgot MPIN) ─────────────
+function showLoginCode(c, justAdded) {
+  const site = location.origin;
+  const msg = `Hello ${c.name}, your DormBook login code is ${c.code}.\nOpen ${site} → "Staff: first time / forgot MPIN" → type your mobile and this code, then set your own MPIN.\nThe code works once and ends in 24 hours. Do not share it.`;
+  const wa = `https://wa.me/91${String(c.mobile || '').slice(-10)}?text=${encodeURIComponent(msg)}`;
+  openModal(justAdded ? `${c.name} added` : `Login code for ${c.name}`, `
+    <p>Give this code to <b>${h(c.name)}</b>. They open DormBook, tap <b>Staff: first time / forgot MPIN</b>, type their mobile and this code, and set their own MPIN.</p>
+    <div class="code-big" aria-label="Login code">${h(String(c.code).replace(/(\d{3})(\d{3})/, '$1 $2'))}</div>
+    <p class="td-small text-center">Works once · ends ${fmtDateTime(c.expires_at)}${c.sms_sent ? ' · also sent by SMS ✓' : ''}</p>
+    <div class="btn-group mt-12 center">
+      <a class="btn btn-whatsapp" href="${h(wa)}" target="_blank" rel="noopener">🟢 Send code on WhatsApp</a>
+      <button class="btn btn-outline" onclick="copyText('${h(c.code)}')">Copy code</button>
+      <button class="btn btn-outline" onclick="closeModal()">Done</button>
+    </div>`);
+}
+function fmtDateTime(d) { return d ? new Date(d).toLocaleString('en-IN', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : ''; }
+async function copyText(t) {
+  try { await navigator.clipboard.writeText(t); toast('Copied', 'success'); } catch { toast('Could not copy — please write it down', 'warning'); }
+}
+async function newLoginCode(userId) {
+  try { const c = await api('POST', `/staff/${userId}/login-code`); showLoginCode(c, false); }
+  catch (ex) { toast(ex.message, 'error'); }
+}
+async function unlockStaff(userId) {
+  try { await api('PATCH', `/staff/${userId}`, { unlock: true }); toast('Unlocked. They can sign in again.', 'success'); renderPage('staff'); }
+  catch (ex) { toast(ex.message, 'error'); }
+}
+
+// ── Staff sign-in screen: mobile + code → set MPIN ──────────────
+function showMpinScreen() {
+  const m = document.getElementById('login-email').value.replace(/\D/g, '');
+  if (m.length >= 10) document.getElementById('mp-mobile').value = m.slice(-10);
+  document.getElementById('mp-error').classList.add('hidden');
+  document.getElementById('mp-info').classList.add('hidden');
+  showScreen('mpin-screen');
+}
+async function requestMpinCode() {
+  const info = document.getElementById('mp-info'), err = document.getElementById('mp-error');
+  err.classList.add('hidden');
+  const mobile = document.getElementById('mp-mobile').value.replace(/\D/g, '').slice(-10);
+  if (mobile.length !== 10) { err.textContent = 'Type your 10-digit mobile number first'; err.classList.remove('hidden'); return; }
+  try {
+    const r = await api('POST', '/auth/staff/request-code', { mobile });
+    info.textContent = r.message; info.classList.remove('hidden');
+  } catch (ex) { err.textContent = ex.message; err.classList.remove('hidden'); }
+}
+async function submitMpinSetup() {
+  const err = document.getElementById('mp-error'); err.classList.add('hidden');
+  const btn = document.getElementById('mp-save');
+  const mobile = document.getElementById('mp-mobile').value.replace(/\D/g, '').slice(-10);
+  const code = document.getElementById('mp-code').value.replace(/\D/g, '');
+  const pin = document.getElementById('mp-pin').value, pin2 = document.getElementById('mp-pin2').value;
+  try {
+    if (mobile.length !== 10) throw new Error('Type your 10-digit mobile number');
+    if (code.length !== 6) throw new Error('The login code has 6 digits');
+    if (!/^(\d{4}|\d{6})$/.test(pin)) throw new Error('MPIN must be 4 or 6 digits');
+    if (pin !== pin2) throw new Error('The two MPINs are not the same');
+    btn.disabled = true;
+    const data = await api('POST', '/auth/staff/set-mpin', { mobile, code, mpin: pin });
+    ['mp-code', 'mp-pin', 'mp-pin2'].forEach(id => { document.getElementById(id).value = ''; });
+    startSession(data);
+    toast('MPIN saved. Next time sign in with your mobile and MPIN.', 'success', 6000);
+  } catch (ex) { err.textContent = ex.message; err.classList.remove('hidden'); }
+  btn.disabled = false;
+}
+function startSession(data) {
+  STATE.token = data.token;
+  STATE.user = data.user;
+  sessionStorage.setItem('db_token', data.token);
+  sessionStorage.setItem('db_user', JSON.stringify(data.user));
+  showApp();
+}
+function setToken(token) {
+  STATE.token = token;
+  sessionStorage.setItem('db_token', token);
+}
+
+// ── Bill: send on WhatsApp + pay block (UPI QR, bank) ───────────
+async function sendBillWhatsApp(residentId) {
+  const btn = document.getElementById('bill-wa');
+  if (btn) btn.disabled = true;
+  // Open the tab first (phones block pop-ups opened after a wait), then point it to WhatsApp.
+  const win = window.open('', '_blank');
+  try {
+    const r = await api('POST', `/residents/${residentId}/bill-link`);
+    if (win) { win.opener = null; win.location.href = r.whatsapp_url; } else location.href = r.whatsapp_url;
+    if (!r.mobile) toast('This guest has no valid mobile number — pick the chat in WhatsApp', 'warning', 6000);
+  } catch (ex) { if (win) win.close(); toast(ex.message, 'error'); }
+  if (btn) btn.disabled = false;
+}
+function payBlock(pay, balance, c = {}) {
+  const payee = c.property_name || c.business_name || '';
+  if (!pay) {
+    return can('settings') ? `<div class="pay-empty no-print">Add your UPI QR and bank details in <a href="#" onclick="event.preventDefault();closeModal();navigate('account')">My Account</a> — guests can then scan and pay from the bill.</div>` : '';
+  }
+  const due = balance > 0 && pay.upi && pay.upi.amount_paise > 0;
+  return `
+    <div class="pay-box">
+      ${pay.upi ? `<div class="pay-qr">${pay.upi.qr_svg}</div>` : ''}
+      <div class="pay-text">
+        <div class="pay-title">${due ? `Scan to pay ${rupees(balance)}` : 'Pay by UPI or bank'}${payee ? ` · to ${h(payee)}` : ''}</div>
+        ${payee ? `<div class="pay-to">${h(payee)}${c.address ? ` · ${h(c.address)}` : ''}${c.phone ? ` · Ph: ${h(c.phone)}` : ''}</div>` : ''}
+        ${pay.upi ? `<div>Any UPI app: GPay, PhonePe, Paytm, BHIM</div><div><b>UPI ID:</b> ${h(pay.upi.id)}${pay.upi.name ? ` (${h(pay.upi.name)})` : ''}</div>` : ''}
+        ${pay.bank ? `<div class="pay-bank"><b>Bank transfer:</b> ${h(pay.bank.holder)}${pay.bank.name ? ` · ${h(pay.bank.name)}` : ''}<br>
+          A/c ${h(pay.bank.account)} · IFSC ${h(pay.bank.ifsc)}${pay.bank.branch ? ` · ${h(pay.bank.branch)}` : ''}</div>` : ''}
+      </div>
+    </div>`;
+}
+
+// ── My Account ─────────────────────────────────────────────────
+async function renderAccount(el) {
+  const u = STATE.user;
+  const isStaff = u.role === 'manager' || u.role === 'reception';
+  const pay = can('settings') ? await api('GET', '/account/payment') : null;
+  el.innerHTML = `
+    <div class="card mb-20">
+      <strong>You</strong>
+      <dl class="facts mt-12">
+        <div><dt>Name</dt><dd>${h(u.name)}</dd></div>
+        <div><dt>Mobile</dt><dd>${h(u.mobile || '—')}</dd></div>
+        <div><dt>Role</dt><dd>${h(u.role === 'reception' ? 'Reception' : u.role === 'manager' ? 'Manager' : 'Owner')}</dd></div>
+        <div><dt>Sign-in</dt><dd>${u.has_mpin ? 'Mobile + MPIN' : 'Password'}</dd></div>
+      </dl>
+      <div class="btn-group mt-12">
+        ${u.has_mpin ? `<button class="btn btn-outline" onclick="showChangeMpin()">Change MPIN</button>` : ''}
+        ${!isStaff || !u.has_mpin ? `<button class="btn btn-outline" onclick="showChangePassword()">Change password</button>` : ''}
+      </div>
+    </div>
+    ${pay ? `
+    <div class="card mb-20">
+      <strong>How guests pay you</strong>
+      <p class="td-small mt-4">Printed at the end of every bill. The QR has the amount due filled in, so the guest just scans and pays.</p>
+      <div class="acc-grid mt-12">
+        <div>
+          <div class="section-title">UPI QR</div>
+          <div class="qr-preview" id="acc-qr">${pay.qr_svg || '<div class="text-muted td-small">No QR yet</div>'}</div>
+          <label class="btn btn-primary mt-12">📷 Scan / upload your QR
+            <input type="file" accept="image/*" capture="environment" hidden onchange="readQrImage(this)" /></label>
+          <div class="field-note">Take a photo of your shop QR (PhonePe, GPay, Paytm, bank QR) or pick a screenshot. We read the UPI ID from it.</div>
+          <div class="field mt-12"><label for="acc-upi">UPI ID</label><input id="acc-upi" value="${h(pay.upi_id)}" placeholder="name@okhdfcbank" autocomplete="off" /></div>
+          <div class="field"><label for="acc-upiname">Name shown to the guest</label><input id="acc-upiname" value="${h(pay.upi_name)}" maxlength="100" /></div>
+          <input type="hidden" id="acc-upiuri" value="" />
+          ${pay.upi_signed ? '<div class="field-note">This is a shop QR with a security signature: guests type the amount themselves.</div>' : ''}
+        </div>
+        <div>
+          <div class="section-title">Bank account (for bank transfer)</div>
+          <div class="field"><label for="acc-holder">Account holder name</label><input id="acc-holder" value="${h(pay.bank_holder)}" maxlength="100" /></div>
+          <div class="field"><label for="acc-bank">Bank name</label><input id="acc-bank" value="${h(pay.bank_name)}" maxlength="100" placeholder="e.g. State Bank of India" /></div>
+          <div class="field"><label for="acc-acno">Account number</label><input id="acc-acno" value="${h(pay.bank_account)}" inputmode="numeric" maxlength="22" autocomplete="off" /></div>
+          <div class="field-row">
+            <div class="field"><label for="acc-ifsc">IFSC</label><input id="acc-ifsc" value="${h(pay.bank_ifsc)}" maxlength="11" style="text-transform:uppercase" placeholder="SBIN0001234" /></div>
+            <div class="field"><label for="acc-branch">Branch</label><input id="acc-branch" value="${h(pay.bank_branch)}" maxlength="100" /></div>
+          </div>
+        </div>
+      </div>
+      <label class="switch-row mt-12"><input type="checkbox" id="acc-show" ${pay.show_pay_on_bill ? 'checked' : ''} />
+        <span><strong>Show on bills</strong><br/><span class="td-small">Turn off to hide QR and bank details from bills.</span></span></label>
+      <div id="acc-error" class="error-msg hidden"></div>
+      <button class="btn btn-primary mt-12" id="acc-save" onclick="savePayment()">Save payment details</button>
+    </div>` : ''}`;
+}
+
+async function savePayment() {
+  const err = document.getElementById('acc-error'); err.classList.add('hidden');
+  const v = (id) => document.getElementById(id).value.trim();
+  const btn = document.getElementById('acc-save'); btn.disabled = true;
+  try {
+    const body = {
+      upi_name: v('acc-upiname'), bank_holder: v('acc-holder'), bank_name: v('acc-bank'),
+      bank_account: v('acc-acno').replace(/[\s-]/g, ''), bank_ifsc: v('acc-ifsc').toUpperCase(), bank_branch: v('acc-branch'),
+      show_pay_on_bill: document.getElementById('acc-show').checked,
+    };
+    if (v('acc-upiuri')) body.upi_uri = v('acc-upiuri'); else body.upi_id = v('acc-upi');
+    if (!!body.bank_account !== !!body.bank_ifsc) throw new Error('Type both the account number and the IFSC (or leave both empty)');
+    await api('PATCH', '/account/payment', body);
+    toast('Payment details saved', 'success');
+    renderPage('account');
+  } catch (ex) { err.textContent = ex.message; err.classList.remove('hidden'); btn.disabled = false; }
+}
+
+/** Read the UPI text from a QR photo. Uses the phone's own reader when it has one, else jsQR (loaded only here). */
+async function readQrImage(input) {
+  const f = input.files && input.files[0];
+  input.value = '';
+  if (!f) return;
+  const err = document.getElementById('acc-error'); err.classList.add('hidden');
+  try {
+    if (!/^image\//.test(f.type) || f.size > 15 * 1024 * 1024) throw new Error('Pick a photo of the QR (JPG or PNG)');
+    const bmp = await createImageBitmap(f);
+    let text = null;
+    if ('BarcodeDetector' in window) {
+      try { const found = await new BarcodeDetector({ formats: ['qr_code'] }).detect(bmp); text = found[0] && found[0].rawValue; } catch (_) { /* fall back */ }
+    }
+    if (!text) {
+      await loadScriptOnce('/js/vendor/jsqr.min.js');
+      for (const max of [1200, 800, 1800]) {          // try a few sizes: big photos and tiny screenshots both work
+        const k = Math.min(1, max / Math.max(bmp.width, bmp.height));
+        const c = document.createElement('canvas'); c.width = Math.round(bmp.width * k); c.height = Math.round(bmp.height * k);
+        const ctx = c.getContext('2d', { willReadFrequently: true }); ctx.drawImage(bmp, 0, 0, c.width, c.height);
+        const img = ctx.getImageData(0, 0, c.width, c.height);
+        const r = window.jsQR(img.data, c.width, c.height, { inversionAttempts: 'attemptBoth' });
+        if (r && r.data) { text = r.data; break; }
+      }
+    }
+    if (!text) throw new Error('Could not read a QR in this photo. Hold the phone steady, fill the frame with the QR, or type your UPI ID.');
+    if (!/^upi:\/\/pay\?/i.test(text)) throw new Error('This QR is not a UPI payment QR. Type your UPI ID instead.');
+    const q = new URLSearchParams(text.slice(text.indexOf('?') + 1));
+    const pa = q.get('pa') || '';
+    if (!pa.includes('@')) throw new Error('No UPI ID found in this QR. Type your UPI ID instead.');
+    document.getElementById('acc-upi').value = pa;
+    if (q.get('pn') && !document.getElementById('acc-upiname').value) document.getElementById('acc-upiname').value = q.get('pn');
+    document.getElementById('acc-upiuri').value = text;
+    document.getElementById('acc-qr').innerHTML = `<div class="td-small text-success">✓ Read: <b>${h(pa)}</b>. Press "Save payment details".</div>`;
+    toast(`UPI ID found: ${pa}`, 'success');
+  } catch (ex) { err.textContent = ex.message; err.classList.remove('hidden'); }
+}
+const _scripts = {};
+function loadScriptOnce(src) {
+  if (!_scripts[src]) {
+    _scripts[src] = new Promise((resolve, reject) => {
+      const el = document.createElement('script');
+      el.src = src; el.onload = resolve;
+      el.onerror = () => { delete _scripts[src]; reject(new Error('Could not load the QR reader. Check your internet and try again.')); };
+      document.head.appendChild(el);
+    });
+  }
+  return _scripts[src];
+}
+
+function showChangePassword() {
+  openModal('Change password', `
+    <div class="field"><label for="cp-old">Current password</label><input id="cp-old" type="password" autocomplete="current-password" /></div>
+    <div class="field"><label for="cp-new">New password (8 or more characters)</label><input id="cp-new" type="password" autocomplete="new-password" /></div>
+    <div class="field"><label for="cp-new2">New password again</label><input id="cp-new2" type="password" autocomplete="new-password" /></div>
+    <p class="td-small">Other phones and computers signed in as you will be signed out.</p>
+    <div id="cp-error" class="error-msg hidden"></div>
+    <div class="btn-group mt-12"><button class="btn btn-primary" id="cp-save" onclick="submitChangePassword()">Change password</button>
+      <button class="btn btn-outline" onclick="closeModal()">Cancel</button></div>`);
+}
+async function submitChangePassword() {
+  const err = document.getElementById('cp-error'); err.classList.add('hidden');
+  const a = document.getElementById('cp-old').value, b = document.getElementById('cp-new').value, c = document.getElementById('cp-new2').value;
+  try {
+    if (b.length < 8) throw new Error('New password must be at least 8 characters');
+    if (b !== c) throw new Error('The two new passwords are not the same');
+    const r = await api('POST', '/auth/change-password', { current_password: a, new_password: b });
+    if (r.token) setToken(r.token);
+    closeModal(); toast('Password changed', 'success');
+  } catch (ex) { err.textContent = ex.message; err.classList.remove('hidden'); }
+}
+function showChangeMpin() {
+  openModal('Change MPIN', `
+    <div class="field"><label for="cm-old">Current MPIN</label><input id="cm-old" type="password" inputmode="numeric" maxlength="6" autocomplete="off" /></div>
+    <div class="field"><label for="cm-new">New MPIN (4 or 6 digits)</label><input id="cm-new" type="password" inputmode="numeric" maxlength="6" autocomplete="off" /></div>
+    <div class="field"><label for="cm-new2">New MPIN again</label><input id="cm-new2" type="password" inputmode="numeric" maxlength="6" autocomplete="off" /></div>
+    <div id="cm-error" class="error-msg hidden"></div>
+    <div class="btn-group mt-12"><button class="btn btn-primary" onclick="submitChangeMpin()">Change MPIN</button>
+      <button class="btn btn-outline" onclick="closeModal()">Cancel</button></div>`);
+}
+async function submitChangeMpin() {
+  const err = document.getElementById('cm-error'); err.classList.add('hidden');
+  const a = document.getElementById('cm-old').value, b = document.getElementById('cm-new').value, c = document.getElementById('cm-new2').value;
+  try {
+    if (!/^(\d{4}|\d{6})$/.test(b)) throw new Error('New MPIN must be 4 or 6 digits');
+    if (b !== c) throw new Error('The two new MPINs are not the same');
+    const r = await api('POST', '/auth/change-mpin', { current_mpin: a, new_mpin: b });
+    if (r.token) setToken(r.token);
+    closeModal(); toast('MPIN changed', 'success');
+  } catch (ex) { err.textContent = ex.message; err.classList.remove('hidden'); }
 }
 
 // ── Boot ──────────────────────────────────────────────────────
