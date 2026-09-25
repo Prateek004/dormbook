@@ -111,38 +111,84 @@ async function getProfile(force) {
 }
 const gstLabel = (bp, incl) => bp ? `${bp / 100}% GST ${incl ? 'incl.' : 'extra'}` : 'No GST';
 
+// ── Cash change helper: guest gives ₹500 for ₹300 → "Give back ₹200" ──
+// Only helps the cashier count; nothing extra is saved (the payment amount is what's recorded).
+function cashChangeBox(pfx) {
+  return `
+    <div class="change-box" id="${pfx}-chg" hidden>
+      <div class="change-row">
+        <label for="${pfx}-given">Cash given by guest</label>
+        <div class="change-in"><span>₹</span><input id="${pfx}-given" type="number" min="0" step="1" inputmode="numeric" placeholder="0" /></div>
+      </div>
+      <div class="change-notes">${[10, 20, 50, 100, 200, 500].map(n => `<button type="button" class="note-btn" data-note="${n}">₹${n}</button>`).join('')}
+        <button type="button" class="note-btn" data-note="exact">Exact</button></div>
+      <div class="change-out" id="${pfx}-out"></div>
+    </div>`;
+}
+/** getDue() → rupees to collect; getMode() → 'cash' | … */
+function bindCashChange(pfx, getDue, getMode) {
+  const box = document.getElementById(`${pfx}-chg`);
+  if (!box) return () => {};
+  const given = document.getElementById(`${pfx}-given`);
+  const out = document.getElementById(`${pfx}-out`);
+  const update = () => {
+    const due = Math.round((Number(getDue()) || 0) * 100);
+    const show = getMode() === 'cash' && due > 0;
+    box.hidden = !show;
+    if (!show) return;
+    const g = Math.round((parseFloat(given.value) || 0) * 100);
+    out.className = 'change-out';
+    if (!given.value) { out.innerHTML = `<span>To collect</span><b>${rupees(due)}</b>`; return; }
+    if (g > due) { out.classList.add('give'); out.innerHTML = `<span>Give back to guest</span><b>${rupees(g - due)}</b>`; }
+    else if (g < due) { out.classList.add('short'); out.innerHTML = `<span>Still short</span><b>${rupees(due - g)}</b>`; }
+    else { out.classList.add('exact'); out.innerHTML = `<span>Exact amount</span><b>✓</b>`; }
+  };
+  given.addEventListener('input', update);
+  box.querySelectorAll('.note-btn').forEach(b => b.addEventListener('click', () => {
+    const due = Number(getDue()) || 0;
+    if (b.dataset.note === 'exact') given.value = due;
+    else { const n = Number(b.dataset.note); given.value = (parseFloat(given.value) || 0) + n; }
+    update();
+  }));
+  update();
+  return update;
+}
+
 // ── Navigation ───────────────────────────────────────────────
 // Short menu. Pages with `tabs` group several screens behind one menu item.
 // Each page/tab shows only if the signed-in user has one of its permissions.
-const PAGES = [
-  { id: 'dashboard', label: '🏠 Today' },
-  { id: 'checkin',   label: '✅ Check In',  perms: ['checkin'] },
-  { id: 'residents', label: '👥 Guests' },
-  { id: 'g-money',   label: '💳 Money', title: 'Money', tabs: [
-    { id: 'payments',  label: 'Payments',   perms: ['payments', 'approvals'] },
-    { id: 'expenses',  label: 'Expenses',   perms: ['expenses'] },
-    { id: 'reconcile', label: 'Cash Close', perms: ['cash_close'] },
+const NAV = [
+  { section: 'Daily work', items: [
+    { id: 'dashboard', label: '🏠 Today' },
+    { id: 'checkin',   label: '✅ Check In',     perms: ['checkin'] },
+    { id: 'residents', label: '👥 Guests' },
+    { id: 'payments',  label: '💳 Take Payment', perms: ['payments', 'approvals'] },
+    { id: 'bookings',  label: '📌 Bookings',     perms: ['bookings'] },
   ] },
-  { id: 'bookings',  label: '📌 Bookings', perms: ['bookings'] },
-  { id: 'g-reports', label: '📊 Reports', title: 'Reports', tabs: [
-    { id: 'summary', label: 'Monthly Summary', perms: ['reports_finance'] },
-    { id: 'reports', label: 'Registers',  perms: ['reports_daily', 'reports_finance'] },
-    { id: 'gst',     label: 'GST',        perms: ['reports_finance'] },
-    { id: 'daily',   label: 'Daily View', perms: ['reports_daily'] },
+  { section: 'Money', items: [
+    { id: 'expenses',  label: '📋 Expenses',     perms: ['expenses'] },
+    { id: 'reconcile', label: '🗃 Cash Close',   perms: ['cash_close'] },
   ] },
-  { id: 'g-settings', label: '⚙️ Settings', title: 'Settings', tabs: [
-    { id: 'settings', label: 'Business',        perms: ['settings'] },
-    { id: 'beds',     label: 'Beds' },
-    { id: 'catalog',  label: 'Items & Prices',  perms: ['settings'] },
-    { id: 'staff',    label: 'Users & Access',  perms: ['staff'] },
-    { id: 'audit',    label: 'Audit Log',       perms: ['audit'] },
+  { section: 'Reports', items: [
+    { id: 'summary',   label: '📈 Monthly Summary', perms: ['reports_finance'] },
+    { id: 'reports',   label: '📊 Registers',       perms: ['reports_daily', 'reports_finance'] },
+    { id: 'gst',       label: '🧾 GST Report',      perms: ['reports_finance'] },
+    { id: 'daily',     label: '📅 Daily View',      perms: ['reports_daily'] },
+  ] },
+  { section: 'Setup', items: [
+    { id: 'beds',      label: '🛏 Beds' },
+    { id: 'catalog',   label: '☕ Items & Prices',  perms: ['settings'] },
+    { id: 'settings',  label: '🏢 Business & GST',  perms: ['settings'] },
+    { id: 'staff',     label: '👤 Users & Access',  perms: ['staff'] },
+    { id: 'audit',     label: '🔍 Audit Log',       perms: ['audit'] },
   ] },
 ];
+const PAGES = NAV.flatMap(g => g.items);
 
 const allowed = (p) => !p.perms || p.perms.some(can);
 function tabsOf(group) { return (group.tabs || []).filter(allowed); }
 /** The menu group a page lives in (or null for a top-level page). */
-function groupOf(page) { return PAGES.find(g => g.tabs && g.tabs.some(t => t.id === page)) || null; }
+function groupOf(page) { return null; }   // no hidden tabs any more: every screen has its own menu item
 
 /** Does the signed-in user have this permission? */
 function can(perm) {
@@ -153,11 +199,13 @@ function can(perm) {
 }
 
 function buildNav() {
-  const pages = PAGES.filter(p => p.tabs ? tabsOf(p).length : allowed(p));
-  const nav   = document.getElementById('nav-list');
-  nav.innerHTML = pages.map(p => `
-    <li><a href="#" data-page="${p.id}">${h(p.label)}</a></li>
-  `).join('');
+  const nav = document.getElementById('nav-list');
+  nav.innerHTML = NAV.map(g => {
+    const items = g.items.filter(allowed);
+    if (!items.length) return '';
+    return `<li class="nav-section">${h(g.section)}</li>` +
+      items.map(p => `<li><a href="#" data-page="${p.id}">${h(p.label)}</a></li>`).join('');
+  }).join('');
   nav.querySelectorAll('[data-page]').forEach(a =>
     a.addEventListener('click', e => { e.preventDefault(); navigate(a.dataset.page); closeSidebar(); })
   );
@@ -184,8 +232,10 @@ function navigate(page) {
 }
 
 function titleFor(page) {
-  const map = { dashboard:'Today', checkin:'Check In', residents:'Guests', bookings:'Bookings',
-    feedback:'Tenant Feedback', admin:'Admin Panel' };
+  const map = { dashboard: 'Today', checkin: 'Check In', residents: 'Guests', payments: 'Take Payment', bookings: 'Bookings',
+    expenses: 'Expenses', reconcile: 'Cash Close', summary: 'Monthly Summary', reports: 'Registers', gst: 'GST Report',
+    daily: 'Daily View', beds: 'Beds', catalog: 'Items & Prices', settings: 'Business & GST', staff: 'Users & Access',
+    audit: 'Audit Log', feedback: 'Tenant Feedback', admin: 'Admin Panel' };
   return map[page] || page;
 }
 
@@ -907,6 +957,7 @@ async function renderCheckin(el) {
           <select id="ci-mode"><option value="cash">Cash</option><option value="upi">UPI</option><option value="card">Card</option><option value="bank_transfer">Bank transfer</option></select></div>
       </div>
       <div class="summary-box" id="ci-summary"></div>
+      ${cashChangeBox('ci')}
 
       <details class="more">
         <summary>More details (address, emergency contact, notes)</summary>
@@ -963,6 +1014,9 @@ async function renderCheckin(el) {
   $('ci-rate-type').addEventListener('change', () => { fillRate(); setOut(); summary(); });
   $('ci-checkin').addEventListener('change', () => { setOut(); summary(); });
   ['ci-checkout', 'ci-rent', 'ci-deposit', 'ci-advance'].forEach(id => $(id).addEventListener('input', summary));
+  const ciChange = bindCashChange('ci', () => (parseFloat($('ci-deposit').value) || 0) + (parseFloat($('ci-advance').value) || 0), () => $('ci-mode').value);
+  ['ci-deposit', 'ci-advance'].forEach(id => $(id).addEventListener('input', ciChange));
+  $('ci-mode').addEventListener('change', ciChange);
   $('ci-idtype').addEventListener('change', idHint);
   ['front', 'back'].forEach(side => $(`up-${side}`).addEventListener('change', async (e) => {
     const f = e.target.files[0];
@@ -1156,6 +1210,7 @@ async function showCheckoutModal(id, name) {
     <div id="co-bill" class="bill"><div class="loading-spinner" style="margin:12px auto"></div></div>
     <div class="field"><label for="co-mode">Money paid / returned by</label>
       <select id="co-mode"><option value="cash">Cash</option><option value="upi">UPI</option><option value="bank_transfer">Bank transfer</option><option value="card">Card</option></select></div>
+    ${cashChangeBox('co')}
     <div id="co-error" class="error-msg hidden"></div>
     <div class="btn-group mt-12">
       <button class="btn btn-danger btn-lg" id="co-submit" disabled onclick="submitCheckout('${id}')">Confirm check-out</button>
@@ -1179,6 +1234,7 @@ async function showCheckoutModal(id, name) {
           ? line('<b>Collect from guest</b>', `<b>${rupees(p.to_collect_paise)}</b>`, 'bill-total bad')
           : line('<b>Give back to guest</b>', `<b>${rupees(p.refund_paise)}</b>`, 'bill-total good'))
         + (p.needs_approval ? '<div class="td-small mt-12">The refund will wait for the owner\'s approval. The bed is freed after approval.</div>' : '');
+      window._coChange && window._coChange();
       const btn = document.getElementById('co-submit');
       btn.disabled = false;
       btn.textContent = p.to_collect_paise > 0 ? `Collect ${rupees(p.to_collect_paise)} & check out`
@@ -1188,6 +1244,9 @@ async function showCheckoutModal(id, name) {
       document.getElementById('co-submit').disabled = true;
     }
   };
+  window._coChange = bindCashChange('co', () => (window._coPreview && window._coPreview.to_collect_paise > 0 ? window._coPreview.to_collect_paise / 100 : 0),
+    () => document.getElementById('co-mode').value);
+  document.getElementById('co-mode').addEventListener('change', window._coChange);
   document.getElementById('co-date').addEventListener('change', load);
   document.getElementById('co-extra').addEventListener('input', () => { clearTimeout(window._coT); window._coT = setTimeout(load, 300); });
   load();
@@ -1267,21 +1326,28 @@ async function renderPayments(el) {
         </div>
         <div class="field"><label>Billing Month</label><input id="pay-month" type="month" value="${todayIST().slice(0,7)}" /></div>
       </div>
+      ${cashChangeBox('pay')}
       <div class="field"><label>Notes</label><input id="pay-notes" /></div>
       <div id="pay-error" class="error-msg hidden"></div>
       <button class="btn btn-primary mt-12" onclick="submitPayment()">💳 Record Payment</button>
     </div>
   `;
+  const upd = bindCashChange('pay', () => document.getElementById('pay-amount').value, () => document.getElementById('pay-mode').value);
+  document.getElementById('pay-amount').addEventListener('input', upd);
+  document.getElementById('pay-mode').addEventListener('change', upd);
 }
 
-function showPaymentModal(residentId, residentName) {
-  openModal(`Record Payment: ${residentName}`, `
+async function showPaymentModal(residentId, residentName) {
+  let dues = 0;
+  try { const r = await api('GET', `/residents/${residentId}`); dues = r.balance && r.balance.dues_paise > 0 ? r.balance.dues_paise : 0; } catch (_) { /* amount can still be typed */ }
+  openModal(`Take payment: ${residentName}`, `
     <input type="hidden" id="pm-resident" value="${residentId}" />
     <div class="field-row">
       <div class="field"><label>Type</label>
         <select id="pm-type"><option value="rent">Rent</option><option value="advance">Advance</option><option value="deposit">Deposit</option><option value="extra_charge">Extra Charge</option></select>
       </div>
-      <div class="field"><label>Amount (₹) *</label><input id="pm-amount" type="number" min="0.01" step="0.01" placeholder="e.g. 5000" /></div>
+      <div class="field"><label>Amount (₹) *</label><input id="pm-amount" type="number" min="0.01" step="0.01" placeholder="e.g. 5000" value="${dues ? (dues / 100) : ''}" />
+        ${dues ? `<div class="field-note">Due now: ${rupees(dues)}</div>` : ''}</div>
     </div>
     <div class="field-row">
       <div class="field"><label>Payment Mode</label>
@@ -1289,6 +1355,7 @@ function showPaymentModal(residentId, residentName) {
       </div>
       <div class="field"><label>Billing Month</label><input id="pm-month" type="month" value="${todayIST().slice(0,7)}" /></div>
     </div>
+    ${cashChangeBox('pm')}
     <div class="field"><label>Notes</label><input id="pm-notes" /></div>
     <div id="pm-error" class="error-msg hidden"></div>
     <div class="btn-group mt-12">
@@ -1296,6 +1363,9 @@ function showPaymentModal(residentId, residentName) {
       <button class="btn btn-outline" onclick="closeModal()">Cancel</button>
     </div>
   `);
+  const upd = bindCashChange('pm', () => document.getElementById('pm-amount').value, () => document.getElementById('pm-mode').value);
+  document.getElementById('pm-amount').addEventListener('input', upd);
+  document.getElementById('pm-mode').addEventListener('change', upd);
 }
 
 // Records a payment; if the server says an identical one was saved <1 min ago,
@@ -1403,12 +1473,15 @@ async function showAddItemModal(residentId, residentName) {
       </div>
     </div>
     <div class="field" id="ai-mode-wrap" hidden><label for="ai-mode">Paid by</label>
-      <select id="ai-mode"><option value="cash">Cash</option><option value="upi">UPI</option><option value="card">Card</option></select></div>
+      <select id="ai-mode" onchange="cartRender()"><option value="cash">Cash</option><option value="upi">UPI</option><option value="card">Card</option></select></div>
+    ${cashChangeBox('ai')}
     <div id="ai-error" class="error-msg hidden"></div>
     <div class="btn-group mt-12">
       <button class="btn btn-primary" id="ai-submit" onclick="submitAddItems()" disabled>Add to bill</button>
       <button class="btn btn-outline" onclick="closeModal()">Cancel</button>
     </div>`);
+  window._cart.change = bindCashChange('ai', () => document.querySelector('input[name="ai-when"]:checked')?.value === 'immediate' ? (window._cart.total || 0) / 100 : 0,
+    () => document.getElementById('ai-mode').value);
   cartRender();
 }
 
@@ -1460,6 +1533,8 @@ function cartRender() {
     : '<div class="td-small text-muted">No items added yet.</div>';
   const paidNow = document.querySelector('input[name="ai-when"]:checked')?.value === 'immediate';
   document.getElementById('ai-mode-wrap').hidden = !paidNow;
+  window._cart.total = total;
+  if (window._cart.change) window._cart.change();
   const btn = document.getElementById('ai-submit');
   btn.disabled = !lines.length;
   btn.textContent = lines.length ? (paidNow ? `Save · ${rupees(total)} paid` : `Add ${rupees(total)} to bill`) : 'Add to bill';
