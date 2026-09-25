@@ -23,11 +23,16 @@ const MODE_LABEL = { cash: 'Cash', upi: 'UPI', card: 'Card', bank_transfer: 'Ban
 function company(db, propertyId) {
   const p = db.prepare('SELECT * FROM properties WHERE id = ?').get(propertyId) || {};
   const acc = p.account_id ? db.prepare('SELECT business_name FROM accounts WHERE id = ?').get(p.account_id) : null;
-  return {
+  const out = {
     business_name: acc ? acc.business_name : (p.name || ''), property_name: p.name || '',
     address: [p.address, p.city, p.state, p.pincode].filter(Boolean).join(', '),
-    phone: p.contact_phone || p.whatsapp_number || '', email: p.contact_email || '', gstin: p.gstin || '',
+    phone: p.contact_phone || p.whatsapp_number || '', email: p.contact_email || '',
+    // GSTIN is printed whenever the business has one (registered businesses must show it even on 0% bills).
+    gstin: p.gstin || '',
   };
+  // What is still empty in Business & GST (shown to staff above a bill, never printed).
+  out.missing = [!p.address && 'address', !out.phone && 'phone', p.gst_enabled && !p.gstin && 'GSTIN'].filter(Boolean);
+  return out;
 }
 
 function billNo(rowid) { return `B-${String(rowid || 0).padStart(5, '0')}`; }
@@ -56,6 +61,44 @@ const REPORTS = {
           col('mode', 'Mode'), col('staff', 'Received by'), col('amount', 'Amount', 'money')],
         rows, totals: { amount: rows.reduce((s, r) => s + r.amount, 0) },
         summary: Object.entries(byMode).map(([k, v]) => ({ label: k, value: v, type: 'money' })),
+      };
+    },
+  },
+
+  modes: {
+    title: 'Cash & Online Payments', perm: 'reports_finance',
+    build(db, pid, from, to) {
+      // Money received (payments + deposits) per day, split by how it was paid.
+      const got = db.prepare(`SELECT biz_date d, mode, SUM(amount_paise) amt FROM ledger_entries
+        WHERE property_id = ? AND biz_date BETWEEN ? AND ? AND kind IN ('PAYMENT','DEPOSIT_IN')
+        GROUP BY biz_date, mode ORDER BY biz_date`).all(pid, from, to);
+      const back = db.prepare(`SELECT mode, SUM(amount_paise) amt FROM ledger_entries
+        WHERE property_id = ? AND biz_date BETWEEN ? AND ? AND kind IN ('DEPOSIT_REFUND','CREDIT_REFUND')
+        GROUP BY mode`).all(pid, from, to);
+      const days = new Map();
+      for (const g of got) {
+        const r = days.get(g.d) || { date: g.d, cash: 0, upi: 0, card: 0, bank: 0 };
+        const k = g.mode === 'bank_transfer' ? 'bank' : (['cash', 'upi', 'card'].includes(g.mode) ? g.mode : 'cash');
+        r[k] += g.amt;
+        days.set(g.d, r);
+      }
+      const rows = [...days.values()].map((r) => ({ ...r, online: r.upi + r.card + r.bank, total: r.cash + r.upi + r.card + r.bank }));
+      const sum = (k) => rows.reduce((a, r) => a + r[k], 0);
+      const cashBack = back.filter((x) => x.mode === 'cash').reduce((a, x) => a + x.amt, 0);
+      const onlineBack = back.filter((x) => x.mode !== 'cash').reduce((a, x) => a + x.amt, 0);
+      return {
+        columns: [col('date', 'Date', 'date'), col('cash', 'Cash', 'money'), col('upi', 'UPI', 'money'), col('card', 'Card', 'money'),
+          col('bank', 'Bank transfer', 'money'), col('online', 'Online total', 'money'), col('total', 'Total received', 'money')],
+        rows,
+        totals: { cash: sum('cash'), upi: sum('upi'), card: sum('card'), bank: sum('bank'), online: sum('online'), total: sum('total') },
+        summary: [
+          { label: 'Cash received', value: sum('cash'), type: 'money' },
+          { label: 'Online received (UPI + card + bank)', value: sum('online'), type: 'money' },
+          { label: 'Total received', value: sum('total'), type: 'money' },
+          { label: 'Given back in cash (refunds)', value: cashBack, type: 'money' },
+          { label: 'Given back online (refunds)', value: onlineBack, type: 'money' },
+        ],
+        notes: 'Received = rent, items and deposits taken from guests. Refunds are shown separately. Expenses are not included.',
       };
     },
   },
