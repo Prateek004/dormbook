@@ -43,17 +43,18 @@
         </div>
         <form id="login-form" onsubmit="return false">
           <div class="field">
-            <label for="login-email">Email or Mobile</label>
-            <input id="login-email" type="text" placeholder="owner@pg.com or 9XXXXXXXXX" autocomplete="username" required />
+            <label for="login-email">Mobile number or email</label>
+            <input id="login-email" type="text" placeholder="9XXXXXXXXX" autocomplete="username" required />
           </div>
           <div class="field">
-            <label for="login-password">Password</label>
-            <input id="login-password" type="password" placeholder="••••••••" autocomplete="current-password" required />
+            <label for="login-password">MPIN or password</label>
+            <input id="login-password" type="password" placeholder="••••" autocomplete="current-password" required />
           </div>
           <div id="login-error" class="error-msg hidden"></div>
           <button type="submit" id="login-btn" class="btn btn-primary btn-full">Sign In</button>
         </form>
         <div class="auth-links">
+          <a href="#" id="goto-mpin" class="staff-link">👤 Staff: first time / forgot MPIN?</a>
           <a href="#" id="goto-register">New to DormBook? Create account</a>
           <span style="color:var(--text-2);font-size:13px">Forgot password? Contact DormBook support.</span>
         </div>
@@ -108,6 +109,51 @@
         </form>
         <div class="auth-links">
           <a href="#" id="goto-login">Already have an account? Sign in</a>
+        </div>
+      </div>
+    </div>
+
+    <div id="mpin-screen" class="screen hidden">
+      <div class="auth-card">
+        <div class="auth-logo">
+          <svg width="40" height="40" viewBox="0 0 48 48" fill="none">
+            <rect width="48" height="48" rx="12" fill="#6366f1"/>
+            <path d="M12 36V14a2 2 0 012-2h20a2 2 0 012 2v22" stroke="white" stroke-width="2.5" stroke-linecap="round"/>
+            <rect x="18" y="22" width="5" height="5" rx="1" fill="white"/>
+            <rect x="25" y="22" width="5" height="5" rx="1" fill="white"/>
+            <rect x="18" y="30" width="5" height="5" rx="1" fill="white"/>
+            <rect x="25" y="30" width="5" height="5" rx="1" fill="white"/>
+          </svg>
+          <h1>Set your MPIN</h1>
+          <p>Staff sign-in · first time or forgot MPIN</p>
+        </div>
+        <form id="mpin-form" onsubmit="return false">
+          <div class="field">
+            <label for="mp-mobile">Your mobile number</label>
+            <input id="mp-mobile" type="tel" inputmode="numeric" maxlength="14" placeholder="9XXXXXXXXX" autocomplete="username" />
+          </div>
+          <div class="field">
+            <label for="mp-code">6-digit login code</label>
+            <input id="mp-code" type="text" inputmode="numeric" maxlength="7" placeholder="Ask your owner for it" autocomplete="one-time-code" />
+            <a href="#" id="mp-sms" class="field-note">No code? Get one by SMS</a>
+          </div>
+          <div id="mp-info" class="info-msg hidden"></div>
+          <div class="field-row">
+            <div class="field">
+              <label for="mp-pin">New MPIN (4 or 6 digits)</label>
+              <input id="mp-pin" type="password" inputmode="numeric" maxlength="6" autocomplete="new-password" />
+            </div>
+            <div class="field">
+              <label for="mp-pin2">MPIN again</label>
+              <input id="mp-pin2" type="password" inputmode="numeric" maxlength="6" autocomplete="new-password" />
+            </div>
+          </div>
+          <div class="field-note">Don't use easy ones like 1234, 1111 or the end of your mobile number.</div>
+          <div id="mp-error" class="error-msg hidden"></div>
+          <button type="button" id="mp-save" class="btn btn-primary btn-full mt-12">Save MPIN &amp; sign in</button>
+        </form>
+        <div class="auth-links">
+          <a href="#" id="goto-login-3">Back to Sign In</a>
         </div>
       </div>
     </div>
